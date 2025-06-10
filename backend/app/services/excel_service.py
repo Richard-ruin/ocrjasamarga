@@ -30,11 +30,11 @@ def generate_excel(data: List[dict], save_dir: Path) -> Path:
         # Cek kondisi
         kondisi = entry.get("kondisi", "").lower()
         if kondisi == "baik":
-            ws[f'F{row}'] = "✔"
+            ws[f'F{row}'] = "√"
         elif kondisi == "sedang":
-            ws[f'G{row}'] = "✔"
+            ws[f'G{row}'] = "√"
         elif kondisi == "buruk":
-            ws[f'H{row}'] = "✔"
+            ws[f'H{row}'] = "√"
 
         # Keterangan
         ws[f'I{row}'] = entry.get("keterangan", "")
