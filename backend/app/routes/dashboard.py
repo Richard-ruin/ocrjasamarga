@@ -363,21 +363,142 @@ async def generate_file(
         raise HTTPException(status_code=500, detail=f"Failed to generate Excel file: {str(e)}")
 
 # 🟣 Simpan dan Pindahkan ke History
+# Perbaikan untuk backend save endpoint
+
 @router.post("/save")
-def save_to_history():
+async def save_data(
+    entries: List[str] = Form(...),
+    images: List[UploadFile] = File(...)
+):
     """
-    Simpan data sementara ke history dan bersihkan temporary data
+    Simpan data yang dikirim dari frontend ke history
     """
     try:
-        data = list(temp_collection.find({}, {"_id": 0}))
-        if not data:
-            raise HTTPException(status_code=400, detail="Tidak ada data untuk disimpan")
+        # Parse entries dari JSON string
+        parsed_entries = []
+        for entry_str in entries:
+            try:
+                entry_data = json.loads(entry_str)
+                parsed_entries.append(entry_data)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse entry: {entry_str}, error: {e}")
+                continue
+
+        if not parsed_entries:
+            raise HTTPException(status_code=400, detail="Tidak ada data valid untuk disimpan")
+
+        # Validasi jumlah images sesuai dengan entries
+        if len(images) != len(parsed_entries):
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Jumlah gambar ({len(images)}) tidak sesuai dengan jumlah entries ({len(parsed_entries)})"
+            )
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         folder_path = IMAGE_SAVED_DIR / timestamp
         folder_path.mkdir(parents=True, exist_ok=True)
 
-        logger.info(f"Saving {len(data)} entries to history: {timestamp}")
+        logger.info(f"Saving {len(parsed_entries)} entries to history: {timestamp}")
+
+        # Simpan gambar dan update path
+        saved_data = []
+        successful_saves = 0
+        
+        for i, (entry, image) in enumerate(zip(parsed_entries, images)):
+            try:
+                # Validasi gambar
+                if not image.content_type.startswith('image/'):
+                    logger.warning(f"File {image.filename} bukan gambar valid")
+                    continue
+
+                # Generate nama file unik
+                file_extension = Path(image.filename).suffix
+                new_filename = f"img_{i+1:03d}_{timestamp}{file_extension}"
+                image_path = folder_path / new_filename
+
+                # Simpan gambar
+                content = await image.read()
+                with open(image_path, "wb") as f:
+                    f.write(content)
+
+                # Update entry dengan path gambar
+                entry_with_image = {
+                    **entry,
+                    "foto_path": str(image_path),
+                    "foto_filename": image.filename,
+                    "saved_at": datetime.now().isoformat()
+                }
+                
+                saved_data.append(entry_with_image)
+                successful_saves += 1
+                
+            except Exception as e:
+                logger.error(f"Failed to save entry {i}: {e}")
+                # Tetap simpan entry tanpa gambar jika terjadi error
+                entry_with_error = {
+                    **entry,
+                    "foto_path": "",
+                    "foto_filename": image.filename if image else "",
+                    "error": str(e),
+                    "saved_at": datetime.now().isoformat()
+                }
+                saved_data.append(entry_with_error)
+
+        if not saved_data:
+            raise HTTPException(status_code=400, detail="Tidak ada data yang berhasil disimpan")
+
+        # Simpan ke history collection
+        history_entry = {
+            "timestamp": timestamp,
+            "data": saved_data,
+            "summary": {
+                "total_entries": len(saved_data),
+                "successful_saves": successful_saves,
+                "images_saved": successful_saves,
+                "folder_path": str(folder_path),
+                "created_at": datetime.now().isoformat()
+            }
+        }
+
+        # Insert ke MongoDB
+        result = history_collection.insert_one(history_entry)
+        
+        if not result.inserted_id:
+            raise HTTPException(status_code=500, detail="Gagal menyimpan ke database")
+
+        logger.info(f"Successfully saved history entry with ID: {result.inserted_id}")
+        
+        return {
+            "message": f"Data berhasil disimpan ke history",
+            "timestamp": timestamp,
+            "total_saved": len(saved_data),
+            "successful_images": successful_saves,
+            "history_id": str(result.inserted_id)
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in save_data: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+
+# Alternatif: Jika Anda ingin tetap menggunakan logika lama, buat endpoint terpisah
+@router.post("/save-temp")
+def save_temp_to_history():
+    """
+    Simpan data dari temporary collection ke history (logika lama)
+    """
+    try:
+        data = list(temp_collection.find({}, {"_id": 0}))
+        if not data:
+            raise HTTPException(status_code=400, detail="Tidak ada data temporary untuk disimpan")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder_path = IMAGE_SAVED_DIR / timestamp
+        folder_path.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"Saving {len(data)} entries from temp to history: {timestamp}")
 
         # Pindahkan gambar ke folder history
         successful_moves = 0
@@ -407,28 +528,26 @@ def save_to_history():
                 "created_at": datetime.now().isoformat()
             }
         }
-        
-        history_collection.insert_one(history_entry)
 
-        # Bersihkan temporary collection
-        temp_collection.delete_many({})
+        result = history_collection.insert_one(history_entry)
         
-        logger.info(f"Successfully saved {len(data)} entries to history")
-        
-        return {
-            "message": "Data berhasil disimpan",
-            "summary": {
-                "total_entries": len(data),
-                "images_moved": successful_moves,
-                "timestamp": timestamp
+        if result.inserted_id:
+            # Hapus data temporary setelah berhasil disimpan
+            temp_collection.delete_many({})
+            logger.info(f"Temporary data cleared after successful save")
+            
+            return {
+                "message": "Data berhasil dipindahkan ke history",
+                "timestamp": timestamp,
+                "total_moved": len(data),
+                "images_moved": successful_moves
             }
-        }
-        
-    except HTTPException:
-        raise
+        else:
+            raise HTTPException(status_code=500, detail="Gagal menyimpan ke database")
+
     except Exception as e:
-        logger.error(f"Error saving to history: {e}")
-        raise HTTPException(status_code=500, detail="Failed to save data to history")
+        logger.error(f"Error in save_temp_to_history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # 🆕 Endpoint tambahan untuk testing dan debugging
 @router.post("/test-ocr")

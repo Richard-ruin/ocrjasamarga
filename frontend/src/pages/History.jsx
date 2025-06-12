@@ -17,7 +17,7 @@ const History = () => {
       const res = await axios.get("http://localhost:8000/api/history");
       setHistory(res.data);
     } catch (err) {
-      console.error(err);
+      console.error("Error fetching history:", err);
       alert("Gagal memuat data history");
     } finally {
       setIsLoading(false);
@@ -40,20 +40,56 @@ const History = () => {
       setShowConfirmModal(false);
       setDeleteId(null);
     } catch (err) {
-      console.error(err);
+      console.error("Error deleting history:", err);
       alert("Gagal menghapus data");
     }
   };
 
   const formatDate = (dateString) => {
-    const date = new Date(dateString);
-    return date.toLocaleDateString('id-ID', {
-      year: 'numeric',
-      month: 'long',
-      day: 'numeric',
-      hour: '2-digit',
-      minute: '2-digit'
-    });
+    try {
+      // Handle different date formats
+      let date;
+      
+      if (!dateString) {
+        return "Tanggal tidak tersedia";
+      }
+      
+      // Jika dateString adalah ISO format
+      if (dateString.includes('T') || dateString.includes('-')) {
+        date = new Date(dateString);
+      } 
+      // Jika dateString adalah timestamp format YYYYMMDD_HHMMSS
+      else if (dateString.includes('_') && dateString.length === 15) {
+        const year = dateString.substring(0, 4);
+        const month = dateString.substring(4, 6);
+        const day = dateString.substring(6, 8);
+        const hour = dateString.substring(9, 11);
+        const minute = dateString.substring(11, 13);
+        const second = dateString.substring(13, 15);
+        
+        date = new Date(`${year}-${month}-${day}T${hour}:${minute}:${second}`);
+      }
+      // Fallback
+      else {
+        date = new Date(dateString);
+      }
+      
+      // Check if date is valid
+      if (isNaN(date.getTime())) {
+        return "Format tanggal tidak valid";
+      }
+      
+      return date.toLocaleDateString('id-ID', {
+        year: 'numeric',
+        month: 'long',
+        day: 'numeric',
+        hour: '2-digit',
+        minute: '2-digit'
+      });
+    } catch (error) {
+      console.error("Error formatting date:", error, "Input:", dateString);
+      return "Error format tanggal";
+    }
   };
 
   const getStatusColor = (dataLength) => {
@@ -194,7 +230,7 @@ const History = () => {
                         <div className="w-2 h-2 bg-blue-400 rounded-full mr-3"></div>
                         <div>
                           <div className="text-sm font-medium text-gray-900">
-                            {formatDate(item.saved_at)}
+                            {formatDate(item.saved_at || item.timestamp || item.summary?.created_at)}
                           </div>
                           <div className="text-sm text-gray-500">
                             ID: {item._id}

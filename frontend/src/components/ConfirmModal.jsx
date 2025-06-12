@@ -1,4 +1,7 @@
-const ConfirmModal = ({ title, message, onConfirm, onCancel }) => {
+const ConfirmModal = ({ isOpen, title, message, onConfirm, onClose }) => {
+  // ✅ Jangan render jika isOpen = false
+  if (!isOpen) return null;
+
   return (
     <div className="fixed inset-0 bg-black/50 backdrop-blur-sm flex items-center justify-center p-4 z-50">
       <div className="bg-white rounded-2xl shadow-2xl w-full max-w-md overflow-hidden">
@@ -37,7 +40,7 @@ const ConfirmModal = ({ title, message, onConfirm, onCancel }) => {
         <div className="px-6 pb-6">
           <div className="flex justify-end space-x-3">
             <button
-              onClick={onCancel}
+              onClick={onClose}
               className="px-6 py-3 border border-gray-300 text-gray-700 rounded-xl hover:bg-gray-50 transition-colors font-medium"
             >
               Batal
