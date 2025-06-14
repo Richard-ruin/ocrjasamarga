@@ -8,6 +8,7 @@ import shutil
 import uuid
 import json
 import logging
+import os
 
 from app.services.ocr_service import extract_coordinates_from_image
 from app.services.excel_service import generate_excel
@@ -50,60 +51,58 @@ def get_all_history():
         raise HTTPException(status_code=500, detail="Failed to fetch history data")
 
 
-# Add this to your existing history routes file
-
-@router.post("/generate-from-history/{item_id}")
-def generate_excel_from_history(item_id: str):
+# ✅ FIXED: Generate OCR Excel from History
+@router.post("/generate-ocr-from-history/{item_id}")
+def generate_ocr_excel_from_history(item_id: str):
     """
-    Generate Excel file from saved history data
-    Reuses OCR coordinates and images from history without re-processing
+    Generate Excel file from history images by reprocessing OCR
     """
     try:
-        # Ambil data history
         object_id = ObjectId(item_id)
         doc = history_collection.find_one({"_id": object_id})
         if not doc:
             raise HTTPException(status_code=404, detail="History not found")
-        
-        # Validasi data
+
         if "data" not in doc or not isinstance(doc["data"], list):
             raise HTTPException(status_code=400, detail="No data found in history")
-        
+
         history_data = doc["data"]
         if not history_data:
             raise HTTPException(status_code=400, detail="History data is empty")
-        
-        logger.info(f"Generating Excel from history {item_id} with {len(history_data)} items")
-        
-        # Siapkan data untuk excel service
+
+        logger.info(f"Generating Excel with OCR from history {item_id}, total {len(history_data)} items")
+
         full_entries = []
         for i, item in enumerate(history_data, start=1):
             try:
-                # Gunakan data yang sudah ada di history
+                foto_path = item.get("foto_path", "")
+                if not foto_path or not Path(foto_path).exists():
+                    logger.warning(f"Image file missing for entry {i}: {foto_path}")
+                    lintang, bujur = "", ""
+                    foto_path = ""
+                else:
+                    # Re-run OCR
+                    from app.services.ocr_service import extract_coordinates_with_validation
+                    lintang, bujur = extract_coordinates_with_validation(str(foto_path))
+                    if not lintang or not bujur:
+                        logger.warning(f"Failed OCR for entry {i}: {foto_path}")
+                        lintang, bujur = "", ""
+
                 entry_complete = {
                     "no": i,
                     "jalur": item.get("jalur", ""),
-                    "latitude": item.get("latitude", ""),  # OCR result already saved
-                    "longitude": item.get("longitude", ""), # OCR result already saved
+                    "latitude": lintang,
+                    "longitude": bujur,
                     "kondisi": item.get("kondisi", ""),
                     "keterangan": item.get("keterangan", ""),
-                    "foto_path": item.get("foto_path", ""),
-                    "image": item.get("foto_path", ""),  # Path to saved image
+                    "foto_path": foto_path,
+                    "image": foto_path,
                 }
-                
-                # Validasi apakah file gambar masih ada
-                if entry_complete["foto_path"]:
-                    image_path = Path(entry_complete["foto_path"])
-                    if not image_path.exists():
-                        logger.warning(f"Image file not found for item {i}: {entry_complete['foto_path']}")
-                        entry_complete["foto_path"] = ""
-                        entry_complete["image"] = ""
-                
+
                 full_entries.append(entry_complete)
-                
+
             except Exception as e:
-                logger.error(f"Error processing history item {i}: {e}")
-                # Tetap lanjutkan dengan entry minimal
+                logger.error(f"Error processing OCR from history item {i}: {e}")
                 entry_complete = {
                     "no": i,
                     "jalur": item.get("jalur", ""),
@@ -115,23 +114,108 @@ def generate_excel_from_history(item_id: str):
                     "image": "",
                 }
                 full_entries.append(entry_complete)
-        
+
         if not full_entries:
             raise HTTPException(status_code=400, detail="No valid data to generate Excel")
-        
-        # Generate Excel menggunakan excel service yang sama
+
+        # Generate Excel
         save_dir = UPLOAD_DIR
         save_dir.mkdir(parents=True, exist_ok=True)
         output_path = generate_excel(full_entries, save_dir)
-        
-        logger.info(f"Excel file generated from history successfully: {output_path}")
-        
+
+        logger.info(f"Excel with OCR from history generated: {output_path}")
+
         return FileResponse(
             path=str(output_path),
-            filename=f"history-export-{item_id[:8]}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx",
+            filename=f"ocr-history-{item_id[:8]}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx",
             media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        
+
+    except HTTPException:
+        raise
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid history ID format")
+    except Exception as e:
+        logger.error(f"Error generating OCR Excel from history {item_id}: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate OCR Excel from history: {str(e)}")
+
+
+# ✅ FIXED: Generate Excel from Original History (tanpa OCR ulang)
+@router.post("/generate-from-history/{item_id}")
+def generate_excel_from_history(item_id: str):
+    """
+    Generate Excel file from history data using existing coordinates
+    """
+    try:
+        object_id = ObjectId(item_id)
+        doc = history_collection.find_one({"_id": object_id})
+        if not doc:
+            raise HTTPException(status_code=404, detail="History not found")
+
+        if "data" not in doc or not isinstance(doc["data"], list):
+            raise HTTPException(status_code=400, detail="No data found in history")
+
+        history_data = doc["data"]
+        if not history_data:
+            raise HTTPException(status_code=400, detail="History data is empty")
+
+        logger.info(f"Generating Excel from history {item_id}, total {len(history_data)} items")
+
+        full_entries = []
+        for i, item in enumerate(history_data, start=1):
+            try:
+                # Gunakan koordinat yang sudah tersimpan di history
+                latitude = item.get("latitude", "") or item.get("lintang", "")
+                longitude = item.get("longitude", "") or item.get("bujur", "")
+                
+                foto_path = item.get("foto_path", "")
+                if foto_path and not Path(foto_path).exists():
+                    logger.warning(f"Image file missing for entry {i}: {foto_path}")
+                    foto_path = ""
+
+                entry_complete = {
+                    "no": i,
+                    "jalur": item.get("jalur", ""),
+                    "latitude": latitude,
+                    "longitude": longitude,
+                    "kondisi": item.get("kondisi", ""),
+                    "keterangan": item.get("keterangan", ""),
+                    "foto_path": foto_path,
+                    "image": foto_path,
+                }
+
+                full_entries.append(entry_complete)
+
+            except Exception as e:
+                logger.error(f"Error processing history item {i}: {e}")
+                entry_complete = {
+                    "no": i,
+                    "jalur": item.get("jalur", ""),
+                    "latitude": "",
+                    "longitude": "",
+                    "kondisi": item.get("kondisi", ""),
+                    "keterangan": item.get("keterangan", ""),
+                    "foto_path": "",
+                    "image": "",
+                }
+                full_entries.append(entry_complete)
+
+        if not full_entries:
+            raise HTTPException(status_code=400, detail="No valid data to generate Excel")
+
+        # Generate Excel
+        save_dir = UPLOAD_DIR
+        save_dir.mkdir(parents=True, exist_ok=True)
+        output_path = generate_excel(full_entries, save_dir)
+
+        logger.info(f"Excel from history generated: {output_path}")
+
+        return FileResponse(
+            path=str(output_path),
+            filename=f"history-{item_id[:8]}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+
     except HTTPException:
         raise
     except ValueError:
@@ -141,7 +225,7 @@ def generate_excel_from_history(item_id: str):
         raise HTTPException(status_code=500, detail=f"Failed to generate Excel from history: {str(e)}")
 
 
-# 🔵 Generate Excel from modified history data (untuk EditDashboard)
+# ✅ FIXED: Generate Excel from modified history data (untuk EditDashboard)
 @router.post("/generate-modified-history")
 async def generate_modified_history(
     images: List[UploadFile] = File(...),
@@ -158,7 +242,7 @@ async def generate_modified_history(
         if not parsed:
             raise HTTPException(400, "No entries provided")
         
-        logger.info(f"Generating Excel for modified history {history_id} with {len(parsed)} entries")
+        logger.info(f"Generating Excel for modified history {history_id} with {len(parsed)} entries and {len(images)} images")
         
         # Ambil data history asli untuk referensi
         try:
@@ -173,7 +257,7 @@ async def generate_modified_history(
         
         for i, entry in enumerate(parsed, start=1):
             try:
-                logger.info(f"Processing entry {i}/{len(parsed)}")
+                logger.info(f"Processing entry {i}/{len(parsed)} - is_from_history: {entry.get('is_from_history')}")
                 
                 entry_complete = {
                     "no": i,
@@ -197,38 +281,54 @@ async def generate_modified_history(
                         entry_complete["latitude"] = entry.get("latitude", "")
                         entry_complete["longitude"] = entry.get("longitude", "")
                         logger.info(f"Using existing image for entry {i}: {foto_path}")
+                    else:
+                        logger.warning(f"History image not found for entry {i}: {foto_path}")
                     
                 elif image_index < len(images):
                     # Gambar baru yang di-upload
                     img = images[image_index]
                     image_index += 1
                     
+                    logger.info(f"Processing new image {image_index} for entry {i}: {img.filename}")
+                    
                     # Validasi format file
-                    ext = Path(img.filename).suffix.lower()
-                    if ext not in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
-                        logger.warning(f"Unsupported file format: {ext}")
+                    if img.content_type and not img.content_type.startswith('image/'):
+                        logger.warning(f"Invalid content type for entry {i}: {img.content_type}")
                     else:
                         # Simpan gambar sementara
+                        ext = Path(img.filename).suffix.lower() if img.filename else '.jpg'
+                        if ext not in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
+                            ext = '.jpg'
+                        
                         fname = f"{uuid.uuid4().hex}{ext}"
                         save_path = IMAGE_TEMP_DIR / fname
                         IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
                         
+                        # Save uploaded file
+                        content = await img.read()
                         with save_path.open("wb") as f:
-                            shutil.copyfileobj(img.file, f)
+                            f.write(content)
+                        
+                        logger.info(f"Saved new image to: {save_path}")
                         
                         # OCR untuk gambar baru
-                        from app.services.ocr_service import extract_coordinates_with_validation
-                        lintang, bujur = extract_coordinates_with_validation(str(save_path))
-                        
-                        if lintang and bujur:
-                            logger.info(f"New image {i} coordinates: {lintang}, {bujur}")
-                            entry_complete["latitude"] = lintang
-                            entry_complete["longitude"] = bujur
-                        else:
-                            logger.warning(f"Failed to extract coordinates from new image {i}")
+                        try:
+                            from app.services.ocr_service import extract_coordinates_with_validation
+                            lintang, bujur = extract_coordinates_with_validation(str(save_path))
+                            
+                            if lintang and bujur:
+                                logger.info(f"New image {i} coordinates: {lintang}, {bujur}")
+                                entry_complete["latitude"] = lintang
+                                entry_complete["longitude"] = bujur
+                            else:
+                                logger.warning(f"Failed to extract coordinates from new image {i}")
+                        except Exception as ocr_error:
+                            logger.error(f"OCR error for entry {i}: {ocr_error}")
                         
                         entry_complete["foto_path"] = str(save_path)
                         entry_complete["image"] = str(save_path)
+                else:
+                    logger.warning(f"No image available for entry {i} (image_index: {image_index}, total images: {len(images)})")
                 
                 full_entries.append(entry_complete)
                 
@@ -289,7 +389,6 @@ def get_history_by_id(item_id: str):
                 # Pastikan foto_filename ada
                 if "foto_path" in item and not item.get("foto_filename"):
                     # Extract filename from path
-                    import os
                     item["foto_filename"] = os.path.basename(item["foto_path"])
         
         return doc
@@ -299,49 +398,75 @@ def get_history_by_id(item_id: str):
         logger.error(f"Error fetching history by ID {item_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch history data")
 
-# 🔵 Endpoint untuk mengambil gambar dari history
+
+# ✅ FIXED: Endpoint untuk mengambil gambar dari history
 @router.get("/history/image/{history_id}/{filename}")
 def get_history_image(history_id: str, filename: str):
     try:
-        from fastapi.responses import FileResponse
-        from pathlib import Path
-        
         # Ambil data history untuk mendapatkan folder path
         object_id = ObjectId(history_id)
         doc = history_collection.find_one({"_id": object_id})
         if not doc:
             raise HTTPException(status_code=404, detail="History not found")
         
-        # Cari file di folder history
+        image_path = None
+        
+        # Method 1: Cari di folder history berdasarkan summary
         if "summary" in doc and "folder_path" in doc["summary"]:
             folder_path = Path(doc["summary"]["folder_path"])
-            image_path = folder_path / filename
-            
-            if image_path.exists() and image_path.is_file():
-                return FileResponse(
-                    path=str(image_path),
-                    media_type="image/jpeg",  # atau detect dari extension
-                    headers={"Cache-Control": "max-age=3600"}
-                )
+            potential_path = folder_path / filename
+            if potential_path.exists() and potential_path.is_file():
+                image_path = potential_path
+                logger.info(f"Found image via folder_path: {image_path}")
         
-        # Fallback: cari di seluruh data
-        for item in doc.get("data", []):
-            if item.get("foto_filename") == filename and item.get("foto_path"):
-                image_path = Path(item["foto_path"])
-                if image_path.exists() and image_path.is_file():
-                    return FileResponse(
-                        path=str(image_path),
-                        media_type="image/jpeg",
-                        headers={"Cache-Control": "max-age=3600"}
-                    )
+        # Method 2: Cari berdasarkan foto_path di data
+        if not image_path and "data" in doc:
+            for item in doc["data"]:
+                if item.get("foto_filename") == filename and item.get("foto_path"):
+                    potential_path = Path(item["foto_path"])
+                    if potential_path.exists() and potential_path.is_file():
+                        image_path = potential_path
+                        logger.info(f"Found image via foto_path: {image_path}")
+                        break
         
-        raise HTTPException(status_code=404, detail="Image not found")
+        # Method 3: Cari di semua subfolder IMAGE_SAVED_DIR
+        if not image_path:
+            for subfolder in IMAGE_SAVED_DIR.iterdir():
+                if subfolder.is_dir():
+                    potential_path = subfolder / filename
+                    if potential_path.exists() and potential_path.is_file():
+                        image_path = potential_path
+                        logger.info(f"Found image via search: {image_path}")
+                        break
+        
+        if not image_path:
+            logger.error(f"Image not found: {filename} for history {history_id}")
+            raise HTTPException(status_code=404, detail=f"Image not found: {filename}")
+        
+        # Tentukan media type berdasarkan extension
+        ext = image_path.suffix.lower()
+        media_type_map = {
+            '.jpg': 'image/jpeg',
+            '.jpeg': 'image/jpeg',
+            '.png': 'image/png',
+            '.gif': 'image/gif',
+            '.bmp': 'image/bmp',
+            '.webp': 'image/webp'
+        }
+        media_type = media_type_map.get(ext, 'image/jpeg')
+        
+        return FileResponse(
+            path=str(image_path),
+            media_type=media_type,
+            headers={"Cache-Control": "max-age=3600"}
+        )
         
     except ValueError:
         raise HTTPException(status_code=400, detail="Invalid ID format")
     except Exception as e:
         logger.error(f"Error serving image {filename} for history {history_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to serve image")
+
 
 # 🔴 Hapus Riwayat berdasarkan _id
 @router.delete("/history/{item_id}")
@@ -357,8 +482,6 @@ def delete_history(item_id: str):
         # Hapus folder gambar jika ada
         try:
             if "summary" in doc and "folder_path" in doc["summary"]:
-                import shutil
-                from pathlib import Path
                 folder_path = Path(doc["summary"]["folder_path"])
                 if folder_path.exists():
                     shutil.rmtree(folder_path)
@@ -378,6 +501,7 @@ def delete_history(item_id: str):
     except Exception as e:
         logger.error(f"Error deleting history {item_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete history")
+
 
 # 🟡 Load History ke Dashboard untuk Edit
 @router.post("/history/edit/{item_id}")
@@ -410,6 +534,7 @@ def load_history_to_dashboard(item_id: str):
     except Exception as e:
         logger.error(f"Error loading history to dashboard {item_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to load history to dashboard")
+
 
 # 🟢 Hapus berdasarkan timestamp (backward compatibility)
 @router.delete("/history/delete/{timestamp}")
