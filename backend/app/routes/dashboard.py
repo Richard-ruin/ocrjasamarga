@@ -145,6 +145,108 @@ def parse_coordinates_from_text(text: str) -> tuple[str, str]:
     logger.debug("No coordinate patterns matched")
     return "", ""
 
+@router.post("/generate")
+async def generate_file(
+    images: List[UploadFile] = File(...),
+    entries: List[str] = Form(...)
+):
+    """
+    Generate Excel file dengan OCR koordinat yang diperbaiki
+    """
+    try:
+        # Parse JSON entries dari FormData
+        parsed = [json.loads(e) for e in entries]
+        if not parsed or len(parsed) != len(images):
+            raise HTTPException(400, "Jumlah entries dan images tidak cocok")
+
+        logger.info(f"Generating Excel for {len(images)} images")
+
+        # Siapkan data lengkap untuk excel
+        full_entries = []
+        for i, (entry, img) in enumerate(zip(parsed, images), start=1):
+            try:
+                logger.info(f"Processing image {i}/{len(images)}: {img.filename}")
+                
+                # Validasi format file
+                ext = Path(img.filename).suffix.lower()
+                if ext not in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
+                    logger.warning(f"Unsupported file format: {ext}")
+                    continue
+                
+                # Simpan gambar sementara
+                fname = f"{uuid.uuid4().hex}{ext}"
+                save_path = IMAGE_TEMP_DIR / fname
+                
+                # Pastikan direktori exists
+                IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+                
+                with save_path.open("wb") as f:
+                    shutil.copyfileobj(img.file, f)
+
+                # OCR: ambil lintang & bujur dengan validasi
+                lintang, bujur = extract_coordinates_with_validation(str(save_path))
+                
+                # Log hasil untuk setiap gambar
+                if lintang and bujur:
+                    logger.info(f"Image {i} coordinates: {lintang}, {bujur}")
+                    
+                    # Validasi tambahan untuk wilayah Indonesia
+                    if not is_coordinate_in_indonesia(lintang, bujur):
+                        logger.warning(f"Image {i} coordinates outside Indonesia: {lintang}, {bujur}")
+                else:
+                    logger.warning(f"Failed to extract coordinates from image {i}")
+
+                # Lengkapi entry
+                entry_complete = {
+                    "no": i,
+                    "jalur": entry.get("jalur", ""),
+                    "latitude": lintang,
+                    "longitude": bujur,
+                    "kondisi": entry.get("kondisi", ""),
+                    "keterangan": entry.get("keterangan", ""),
+                    "foto_path": str(save_path),
+                    "image": str(save_path),  # Untuk compatibility dengan excel service
+                }
+                full_entries.append(entry_complete)
+                
+            except Exception as e:
+                logger.error(f"Error processing image {i}: {e}")
+                # Tetap lanjutkan dengan entry kosong untuk koordinat
+                entry_complete = {
+                    "no": i,
+                    "jalur": entry.get("jalur", ""),
+                    "latitude": "",
+                    "longitude": "",
+                    "kondisi": entry.get("kondisi", ""),
+                    "keterangan": entry.get("keterangan", ""),
+                    "foto_path": "",
+                    "image": "",
+                }
+                full_entries.append(entry_complete)
+
+        if not full_entries:
+            raise HTTPException(400, "Tidak ada data yang berhasil diproses")
+
+        # Generate Excel dan kirim file sebagai response download
+        save_dir = UPLOAD_DIR
+        save_dir.mkdir(parents=True, exist_ok=True)
+        output_path = generate_excel(full_entries, save_dir)
+
+        logger.info(f"Excel file generated successfully: {output_path}")
+        
+        return FileResponse(
+            path=str(output_path),
+            filename=output_path.name,
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        )
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in generate_file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate Excel file: {str(e)}")
+
+
 # 🟢 Upload dan Tambah Data Baru
 @router.post("/add")
 async def add_entry(
@@ -420,106 +522,6 @@ def create_empty_entry(index: int, original_entry: dict, error: str = "") -> dic
     }
 # 🟣 Simpan dan Pindahkan ke History
 # Perbaikan untuk backend save endpoint
-@router.post("/generate")
-async def generate_file(
-    images: List[UploadFile] = File(...),
-    entries: List[str] = Form(...)
-):
-    """
-    Generate Excel file dengan OCR koordinat yang diperbaiki
-    """
-    try:
-        # Parse JSON entries dari FormData
-        parsed = [json.loads(e) for e in entries]
-        if not parsed or len(parsed) != len(images):
-            raise HTTPException(400, "Jumlah entries dan images tidak cocok")
-
-        logger.info(f"Generating Excel for {len(images)} images")
-
-        # Siapkan data lengkap untuk excel
-        full_entries = []
-        for i, (entry, img) in enumerate(zip(parsed, images), start=1):
-            try:
-                logger.info(f"Processing image {i}/{len(images)}: {img.filename}")
-                
-                # Validasi format file
-                ext = Path(img.filename).suffix.lower()
-                if ext not in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
-                    logger.warning(f"Unsupported file format: {ext}")
-                    continue
-                
-                # Simpan gambar sementara
-                fname = f"{uuid.uuid4().hex}{ext}"
-                save_path = IMAGE_TEMP_DIR / fname
-                
-                # Pastikan direktori exists
-                IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
-                
-                with save_path.open("wb") as f:
-                    shutil.copyfileobj(img.file, f)
-
-                # OCR: ambil lintang & bujur dengan validasi
-                lintang, bujur = extract_coordinates_with_validation(str(save_path))
-                
-                # Log hasil untuk setiap gambar
-                if lintang and bujur:
-                    logger.info(f"Image {i} coordinates: {lintang}, {bujur}")
-                    
-                    # Validasi tambahan untuk wilayah Indonesia
-                    if not is_coordinate_in_indonesia(lintang, bujur):
-                        logger.warning(f"Image {i} coordinates outside Indonesia: {lintang}, {bujur}")
-                else:
-                    logger.warning(f"Failed to extract coordinates from image {i}")
-
-                # Lengkapi entry
-                entry_complete = {
-                    "no": i,
-                    "jalur": entry.get("jalur", ""),
-                    "latitude": lintang,
-                    "longitude": bujur,
-                    "kondisi": entry.get("kondisi", ""),
-                    "keterangan": entry.get("keterangan", ""),
-                    "foto_path": str(save_path),
-                    "image": str(save_path),  # Untuk compatibility dengan excel service
-                }
-                full_entries.append(entry_complete)
-                
-            except Exception as e:
-                logger.error(f"Error processing image {i}: {e}")
-                # Tetap lanjutkan dengan entry kosong untuk koordinat
-                entry_complete = {
-                    "no": i,
-                    "jalur": entry.get("jalur", ""),
-                    "latitude": "",
-                    "longitude": "",
-                    "kondisi": entry.get("kondisi", ""),
-                    "keterangan": entry.get("keterangan", ""),
-                    "foto_path": "",
-                    "image": "",
-                }
-                full_entries.append(entry_complete)
-
-        if not full_entries:
-            raise HTTPException(400, "Tidak ada data yang berhasil diproses")
-
-        # Generate Excel dan kirim file sebagai response download
-        save_dir = UPLOAD_DIR
-        save_dir.mkdir(parents=True, exist_ok=True)
-        output_path = generate_excel(full_entries, save_dir)
-
-        logger.info(f"Excel file generated successfully: {output_path}")
-        
-        return FileResponse(
-            path=str(output_path),
-            filename=output_path.name,
-            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error in generate_file: {e}")
-        raise HTTPException(status_code=500, detail=f"Failed to generate Excel file: {str(e)}")
 @router.post("/save")
 async def save_data(
     entries: List[str] = Form(...),
