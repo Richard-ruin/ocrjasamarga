@@ -1,4 +1,5 @@
-from fastapi import APIRouter, HTTPException, UploadFile, File, Form
+# app/routes/history.py
+from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from fastapi.responses import FileResponse
 from typing import List
 from pathlib import Path
@@ -10,20 +11,78 @@ import json
 import logging
 import os
 
+from app.services.ocr_service import extract_coordinates_from_image
 from app.services.excel_service import generate_excel
-
-from app.config import history_collection, temp_collection
+from app.ocr_config import CoordinateOCRConfig, enhance_image_for_coordinates, is_coordinate_in_indonesia
+from app.config import db
 from app.constants import UPLOAD_DIR, IMAGE_TEMP_DIR, IMAGE_SAVED_DIR
+from app.routes.auth import get_current_admin
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+# Collections
+history_collection = db["saved_tables"]
+temp_collection = db["temp_entries"]
 
-# 🔵 Ambil Semua History
-@router.get("/history")
-def get_all_history():
+def extract_coordinates_with_validation(image_path: str) -> tuple[str, str]:
+    """Extract coordinates with validation (same as inspeksi.py)"""
     try:
-        all_data = list(history_collection.find({}))
+        logger.info(f"Extracting coordinates from: {image_path}")
+        
+        # Step 1: Enhance gambar untuk OCR yang lebih baik
+        enhanced_path = enhance_image_for_coordinates(image_path)
+        
+        # Step 2: Multiple OCR attempts
+        coordinates_attempts = []
+        
+        # Attempt 1: OCR dengan image asli
+        try:
+            lat1, lon1 = extract_coordinates_from_image(image_path)
+            if lat1 and lon1:
+                coordinates_attempts.append((lat1, lon1, "original"))
+                logger.debug(f"Original OCR result: {lat1}, {lon1}")
+        except Exception as e:
+            logger.debug(f"Original OCR failed: {e}")
+        
+        # Attempt 2: OCR dengan enhanced image
+        if enhanced_path != image_path:
+            try:
+                lat2, lon2 = extract_coordinates_from_image(enhanced_path)
+                if lat2 and lon2:
+                    coordinates_attempts.append((lat2, lon2, "enhanced"))
+                    logger.debug(f"Enhanced OCR result: {lat2}, {lon2}")
+            except Exception as e:
+                logger.debug(f"Enhanced OCR failed: {e}")
+        
+        # Step 3: Pilih hasil terbaik
+        if coordinates_attempts:
+            for lat, lon, source in coordinates_attempts:
+                if is_coordinate_in_indonesia(lat, lon):
+                    logger.info(f"Selected valid coordinates from {source}: {lat}, {lon}")
+                    return lat, lon
+            
+            # Jika tidak ada yang valid untuk Indonesia, ambil yang pertama
+            lat, lon, source = coordinates_attempts[0]
+            logger.info(f"Selected coordinates (fallback) from {source}: {lat}, {lon}")
+            return lat, lon
+        
+        logger.warning(f"No coordinates found in image: {image_path}")
+        return "", ""
+        
+    except Exception as e:
+        logger.error(f"Error in extract_coordinates_with_validation: {e}")
+        return "", ""
+
+@router.get("/history")
+async def get_all_history(current_admin: dict = Depends(get_current_admin)):
+    """Ambil semua history untuk admin yang sedang login"""
+    try:
+        admin_id = str(current_admin["_id"])
+        
+        # Filter history berdasarkan admin_id
+        all_data = list(history_collection.find({"admin_id": admin_id}))
+        
         # Convert ObjectId to string dan pastikan format tanggal konsisten
         for item in all_data:
             item["_id"] = str(item["_id"])
@@ -49,16 +108,18 @@ def get_all_history():
         logger.error(f"Error fetching history: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch history data")
 
-
-# ✅ FIXED: Generate OCR Excel from History
 @router.post("/generate-ocr-from-history/{item_id}")
-def generate_ocr_excel_from_history(item_id: str):
-    """
-    Generate Excel file from history images by reprocessing OCR
-    """
+async def generate_ocr_excel_from_history(
+    item_id: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Generate Excel file from history images by reprocessing OCR"""
     try:
+        admin_id = str(current_admin["_id"])
         object_id = ObjectId(item_id)
-        doc = history_collection.find_one({"_id": object_id})
+        
+        # Pastikan history milik admin yang sedang login
+        doc = history_collection.find_one({"_id": object_id, "admin_id": admin_id})
         if not doc:
             raise HTTPException(status_code=404, detail="History not found")
 
@@ -81,7 +142,6 @@ def generate_ocr_excel_from_history(item_id: str):
                     foto_path = ""
                 else:
                     # Re-run OCR
-                    from app.services.ocr_service import extract_coordinates_with_validation
                     lintang, bujur = extract_coordinates_with_validation(str(foto_path))
                     if not lintang or not bujur:
                         logger.warning(f"Failed OCR for entry {i}: {foto_path}")
@@ -138,16 +198,18 @@ def generate_ocr_excel_from_history(item_id: str):
         logger.error(f"Error generating OCR Excel from history {item_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate OCR Excel from history: {str(e)}")
 
-
-# ✅ FIXED: Generate Excel from Original History (tanpa OCR ulang)
 @router.post("/generate-from-history/{item_id}")
-def generate_excel_from_history(item_id: str):
-    """
-    Generate Excel file from history data using existing coordinates
-    """
+async def generate_excel_from_history(
+    item_id: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Generate Excel file from history data using existing coordinates"""
     try:
+        admin_id = str(current_admin["_id"])
         object_id = ObjectId(item_id)
-        doc = history_collection.find_one({"_id": object_id})
+        
+        # Pastikan history milik admin yang sedang login
+        doc = history_collection.find_one({"_id": object_id, "admin_id": admin_id})
         if not doc:
             raise HTTPException(status_code=404, detail="History not found")
 
@@ -223,19 +285,17 @@ def generate_excel_from_history(item_id: str):
         logger.error(f"Error generating Excel from history {item_id}: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate Excel from history: {str(e)}")
 
-
-# ✅ FIXED: Generate Excel from modified history data (untuk EditDashboard)
 @router.post("/generate-modified-history")
 async def generate_modified_history(
     images: List[UploadFile] = File(...),
     entries: List[str] = Form(...),
-    history_id: str = Form(...)
+    history_id: str = Form(...),
+    current_admin: dict = Depends(get_current_admin)
 ):
-    """
-    Generate Excel from modified history data in EditDashboard
-    Handles mix of existing and new images
-    """
+    """Generate Excel from modified history data in EditDashboard"""
     try:
+        admin_id = str(current_admin["_id"])
+        
         # Parse JSON entries dari FormData
         parsed = [json.loads(e) for e in entries]
         if not parsed:
@@ -243,12 +303,15 @@ async def generate_modified_history(
         
         logger.info(f"Generating Excel for modified history {history_id} with {len(parsed)} entries and {len(images)} images")
         
-        # Ambil data history asli untuk referensi
+        # Ambil data history asli untuk referensi (pastikan milik admin)
         try:
             object_id = ObjectId(history_id)
-            original_doc = history_collection.find_one({"_id": object_id})
+            original_doc = history_collection.find_one({"_id": object_id, "admin_id": admin_id})
         except:
             original_doc = None
+        
+        if not original_doc:
+            raise HTTPException(status_code=404, detail="History not found or access denied")
         
         # Siapkan data lengkap untuk excel
         full_entries = []
@@ -312,7 +375,6 @@ async def generate_modified_history(
                         
                         # OCR untuk gambar baru
                         try:
-                            from app.services.ocr_service import extract_coordinates_with_validation
                             lintang, bujur = extract_coordinates_with_validation(str(save_path))
                             
                             if lintang and bujur:
@@ -368,13 +430,18 @@ async def generate_modified_history(
         logger.error(f"Error generating modified history Excel: {e}")
         raise HTTPException(status_code=500, detail=f"Failed to generate modified Excel: {str(e)}")
 
-
-# 🔵 Ambil Data History Berdasarkan ID (untuk EditDashboard)
 @router.get("/history/{item_id}")
-def get_history_by_id(item_id: str):
+async def get_history_by_id(
+    item_id: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Ambil data history berdasarkan ID (untuk EditDashboard)"""
     try:
+        admin_id = str(current_admin["_id"])
         object_id = ObjectId(item_id)
-        doc = history_collection.find_one({"_id": object_id})
+        
+        # Pastikan history milik admin yang sedang login
+        doc = history_collection.find_one({"_id": object_id, "admin_id": admin_id})
         if not doc:
             raise HTTPException(status_code=404, detail="History not found")
         
@@ -397,14 +464,19 @@ def get_history_by_id(item_id: str):
         logger.error(f"Error fetching history by ID {item_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to fetch history data")
 
-
-# ✅ FIXED: Endpoint untuk mengambil gambar dari history
 @router.get("/history/image/{history_id}/{filename}")
-def get_history_image(history_id: str, filename: str):
+async def get_history_image(
+    history_id: str, 
+    filename: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Endpoint untuk mengambil gambar dari history"""
     try:
-        # Ambil data history untuk mendapatkan folder path
+        admin_id = str(current_admin["_id"])
+        
+        # Ambil data history untuk mendapatkan folder path (pastikan milik admin)
         object_id = ObjectId(history_id)
-        doc = history_collection.find_one({"_id": object_id})
+        doc = history_collection.find_one({"_id": object_id, "admin_id": admin_id})
         if not doc:
             raise HTTPException(status_code=404, detail="History not found")
         
@@ -428,12 +500,14 @@ def get_history_image(history_id: str, filename: str):
                         logger.info(f"Found image via foto_path: {image_path}")
                         break
         
-        # Method 3: Cari di semua subfolder IMAGE_SAVED_DIR
+        # Method 3: Cari di semua subfolder IMAGE_SAVED_DIR (dengan admin_id check)
         if not image_path:
             for subfolder in IMAGE_SAVED_DIR.iterdir():
                 if subfolder.is_dir():
                     potential_path = subfolder / filename
                     if potential_path.exists() and potential_path.is_file():
+                        # Additional check: pastikan gambar ini milik admin
+                        # (bisa ditambahkan logic tambahan jika diperlukan)
                         image_path = potential_path
                         logger.info(f"Found image via search: {image_path}")
                         break
@@ -466,15 +540,18 @@ def get_history_image(history_id: str, filename: str):
         logger.error(f"Error serving image {filename} for history {history_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to serve image")
 
-
-# 🔴 Hapus Riwayat berdasarkan _id
 @router.delete("/history/{item_id}")
-def delete_history(item_id: str):
+async def delete_history(
+    item_id: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Hapus riwayat berdasarkan _id"""
     try:
+        admin_id = str(current_admin["_id"])
         object_id = ObjectId(item_id)
         
-        # Ambil data dulu untuk cleanup file
-        doc = history_collection.find_one({"_id": object_id})
+        # Ambil data dulu untuk cleanup file (pastikan milik admin)
+        doc = history_collection.find_one({"_id": object_id, "admin_id": admin_id})
         if not doc:
             raise HTTPException(status_code=404, detail="Data tidak ditemukan")
         
@@ -501,24 +578,30 @@ def delete_history(item_id: str):
         logger.error(f"Error deleting history {item_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to delete history")
 
-
-# 🟡 Load History ke Dashboard untuk Edit
 @router.post("/history/edit/{item_id}")
-def load_history_to_dashboard(item_id: str):
+async def load_history_to_dashboard(
+    item_id: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Load History ke Dashboard untuk Edit"""
     try:
+        admin_id = str(current_admin["_id"])
         object_id = ObjectId(item_id)
-        doc = history_collection.find_one({"_id": object_id})
+        
+        # Pastikan history milik admin yang sedang login
+        doc = history_collection.find_one({"_id": object_id, "admin_id": admin_id})
         if not doc:
             raise HTTPException(status_code=404, detail="Riwayat tidak ditemukan")
 
-        # Bersihkan dashboard temporary
-        temp_collection.delete_many({})
+        # Bersihkan dashboard temporary untuk admin ini
+        temp_collection.delete_many({"admin_id": admin_id})
         
         # Load data ke temporary collection
         if "data" in doc and isinstance(doc["data"], list):
             for idx, item in enumerate(doc["data"], start=1):
                 item_copy = item.copy()
                 item_copy["no"] = idx
+                item_copy["admin_id"] = admin_id  # Pastikan admin_id ada
                 temp_collection.insert_one(item_copy)
             
             return {
@@ -534,12 +617,22 @@ def load_history_to_dashboard(item_id: str):
         logger.error(f"Error loading history to dashboard {item_id}: {e}")
         raise HTTPException(status_code=500, detail="Failed to load history to dashboard")
 
-
-# 🟢 Hapus berdasarkan timestamp (backward compatibility)
+# Backward compatibility endpoint
 @router.delete("/history/delete/{timestamp}")
-def delete_history_by_timestamp(timestamp: str):
+async def delete_history_by_timestamp(
+    timestamp: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Hapus berdasarkan timestamp (backward compatibility)"""
     try:
-        result = history_collection.delete_one({"timestamp": timestamp})
+        admin_id = str(current_admin["_id"])
+        
+        # Hapus hanya jika milik admin yang sedang login
+        result = history_collection.delete_one({
+            "timestamp": timestamp,
+            "admin_id": admin_id
+        })
+        
         if result.deleted_count == 0:
             raise HTTPException(status_code=404, detail="Data tidak ditemukan")
         return {"message": "Riwayat berhasil dihapus"}

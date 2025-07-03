@@ -1,29 +1,54 @@
-import { useState } from "react";
-import { useNavigate } from "react-router-dom";
-import axios from "axios";
+// src/pages/Login.jsx
+import { useState, useEffect } from "react";
+import { useNavigate, useLocation, Link } from "react-router-dom";
+import { useAuth } from "../context/AuthContext";
+import { useNotification } from "../context/NotificationContext";
 
 const Login = () => {
   const navigate = useNavigate();
+  const location = useLocation();
+  const { login, isAuthenticated } = useAuth();
+  const { success, error } = useNotification();
+  
   const [form, setForm] = useState({ username: "", password: "" });
   const [isLoading, setIsLoading] = useState(false);
+
+  // Handle redirect if already authenticated
+  useEffect(() => {
+    if (isAuthenticated) {
+      const from = location.state?.from?.pathname || "/dashboard";
+      navigate(from, { replace: true });
+    }
+  }, [isAuthenticated, navigate, location.state]);
+
+  // Don't render anything if authenticated (prevents the flash)
+  if (isAuthenticated) {
+    return null;
+  }
 
   const handleSubmit = async (e) => {
     e.preventDefault();
     setIsLoading(true);
     
     try {
-      const res = await axios.post("http://localhost:8000/api/login", form);
-      localStorage.setItem("token", res.data.token);
-      navigate("/dashboard");
+      const result = await login(form);
+      
+      if (result.success) {
+        success(`Selamat datang, ${result.user.full_name}!`);
+        
+        // Navigate after successful login
+        const from = location.state?.from?.pathname || "/dashboard";
+        navigate(from, { replace: true });
+      } else {
+        error(result.error);
+      }
     } catch (error) {
-      console.error(error);
-      alert("Login gagal. Periksa username dan password Anda.");
+      error("Terjadi kesalahan saat login");
     } finally {
       setIsLoading(false);
     }
   };
 
-  // SVG pattern sebagai variabel terpisah untuk menghindari konflik parsing
   const backgroundPattern = "data:image/svg+xml,%3Csvg width='60' height='60' viewBox='0 0 60 60' xmlns='http://www.w3.org/2000/svg'%3E%3Cg fill='none' fill-rule='evenodd'%3E%3Cg fill='%239C92AC' fill-opacity='0.03'%3E%3Ccircle cx='30' cy='30' r='2'/%3E%3C/g%3E%3C/g%3E%3C/svg%3E";
 
   return (
@@ -114,6 +139,18 @@ const Login = () => {
                   </>
                 )}
               </button>
+
+              <div className="text-center">
+                <p className="text-sm text-gray-600">
+                  Belum punya akun?{" "}
+                  <Link 
+                    to="/register" 
+                    className="text-blue-600 hover:text-blue-800 font-medium transition-colors"
+                  >
+                    Daftar di sini
+                  </Link>
+                </p>
+              </div>
             </form>
           </div>
         </div>

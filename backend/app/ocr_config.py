@@ -1,263 +1,186 @@
-# ocr_config.py
-from paddleocr import PaddleOCR
-import logging
-import os
-from typing import Optional
+# ocr_config.py - Konfigurasi tambahan untuk OCR yang lebih optimal
 
-# Setup logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+import easyocr
+import cv2
+import numpy as np
+from typing import List, Dict, Any
 
-# Global OCR instance
-_ocr_instance = None
-
-def get_ocr_instance() -> PaddleOCR:
+class CoordinateOCRConfig:
     """
-    Initialize PaddleOCR instance dengan konfigurasi optimal untuk bahasa Indonesia
-    Updated untuk kompatibilitas dengan versi terbaru PaddleOCR
+    Kelas untuk konfigurasi OCR yang dioptimalkan untuk koordinat
     """
-    global _ocr_instance
     
-    if _ocr_instance is None:
-        try:
-            # Konfigurasi PaddleOCR yang kompatibel dengan versi terbaru
-            logger.info("Initializing PaddleOCR...")
-            
-            # Primary configuration - recommended for coordinate detection
-            ocr_config = {
-                'use_angle_cls': True,  # Deteksi rotasi teks
-                'lang': 'en',          # English untuk angka dan simbol koordinat
-                'det_limit_side_len': 960,  # Optimal untuk akurasi dan speed
-                'det_limit_type': 'max',
-                'rec_batch_num': 6,
-                'max_text_length': 25,
-                'rec_algorithm': 'SVTR_LCNet',  # Better accuracy for small text
-                'drop_score': 0.3,     # Lower threshold untuk menangkap lebih banyak teks
-            }
-            
-            _ocr_instance = PaddleOCR(**ocr_config)
-            logger.info("✅ PaddleOCR initialized successfully with optimized config")
-            
-        except Exception as e:
-            logger.error(f"❌ Failed to initialize PaddleOCR with optimized config: {e}")
-            
-            # Fallback dengan konfigurasi minimal
-            try:
-                logger.info("Trying fallback configuration...")
-                _ocr_instance = PaddleOCR(
-                    use_angle_cls=True,
-                    lang='en'
-                )
-                logger.info("✅ PaddleOCR initialized with fallback config")
-                
-            except Exception as fallback_error:
-                logger.error(f"❌ Fallback PaddleOCR initialization failed: {fallback_error}")
-                
-                # Last resort - basic config
-                try:
-                    logger.info("Trying basic configuration...")
-                    _ocr_instance = PaddleOCR(lang='en')
-                    logger.info("✅ PaddleOCR initialized with basic config")
-                except Exception as basic_error:
-                    logger.error(f"❌ Basic PaddleOCR initialization failed: {basic_error}")
-                    raise Exception("Cannot initialize PaddleOCR with any configuration")
-    
-    return _ocr_instance
-
-# Enhanced pattern untuk koordinat Indonesia dengan variasi format yang lebih fleksibel
-COORDINATE_PATTERNS = {
-    # Pattern utama untuk format standar: 6°52'35,698"S atau 6°52'35.698"S
-    'latitude_primary': r"(\d+)°\s*(\d+)'\s*([\d,\.]+)\s*[\"″]?\s*S",
-    'longitude_primary': r"(\d+)°\s*(\d+)'\s*([\d,\.]+)\s*[\"″]?\s*E",
-    
-    # Pattern alternatif untuk handling OCR errors dan variasi format
-    'latitude_alternatives': [
-        r"(\d+)°\s*(\d+)'\s*([\d,\.]+)\s*[\"″]\s*S",  # Dengan tanda kutip
-        r"(\d+)°\s*(\d+)'\s*([\d,\.]+)\s*′\s*S",      # Dengan prime symbol
-        r"(\d+)°\s*(\d+)'\s*([\d,\.]+)\s*'\s*S",      # OCR salah baca " jadi '
-        r"(\d+)[o°]\s*(\d+)'\s*([\d,\.]+)\s*[\"″]?\s*S",  # OCR salah baca ° jadi o
-        r"(\d+)°\s*(\d+)[`']\s*([\d,\.]+)\s*[\"″]?\s*S", # OCR salah baca ' jadi `
-        r"(\d+)\s*°\s*(\d+)\s*'\s*([\d,\.]+)\s*[\"″]?\s*S", # Dengan spasi ekstra
-        r"(\d+)°(\d+)'([\d,\.]+)\"?S",                 # Tanpa spasi (format compact)
-    ],
-    'longitude_alternatives': [
-        r"(\d+)°\s*(\d+)'\s*([\d,\.]+)\s*[\"″]\s*E",
-        r"(\d+)°\s*(\d+)'\s*([\d,\.]+)\s*′\s*E",
-        r"(\d+)°\s*(\d+)'\s*([\d,\.]+)\s*'\s*E",
-        r"(\d+)[o°]\s*(\d+)'\s*([\d,\.]+)\s*[\"″]?\s*E",
-        r"(\d+)°\s*(\d+)[`']\s*([\d,\.]+)\s*[\"″]?\s*E",
-        r"(\d+)\s*°\s*(\d+)\s*'\s*([\d,\.]+)\s*[\"″]?\s*E",
-        r"(\d+)°(\d+)'([\d,\.]+)\"?E",
-    ]
-}
-
-# Validasi range koordinat Indonesia (diperluas untuk handling margin error)
-INDONESIA_BOUNDS = {
-    'lat_min': -12.0,  # Diperluas dari -11.0 untuk margin error
-    'lat_max': 7.0,    # Diperluas dari 6.0 untuk margin error
-    'lon_min': 94.0,   # Diperluas dari 95.0 untuk margin error
-    'lon_max': 142.0   # Diperluas dari 141.0 untuk margin error
-}
-
-# Validasi range koordinat Bandung dan sekitarnya (diperluas dengan margin)
-BANDUNG_BOUNDS = {
-    'lat_min': -7.8,   # Diperluas untuk area Bandung Raya
-    'lat_max': -5.8,   # Diperluas untuk area Bandung Utara
-    'lon_min': 106.5,  # Diperluas untuk area Bandung Barat
-    'lon_max': 108.5   # Diperluas untuk area Bandung Timur
-}
-
-# Validasi tambahan untuk Jawa Barat
-WEST_JAVA_BOUNDS = {
-    'lat_min': -8.0,
-    'lat_max': -5.5,
-    'lon_min': 106.0,
-    'lon_max': 109.0
-}
-
-# Konfigurasi OCR yang dioptimasi
-OCR_CONFIG = {
-    'confidence_threshold': 0.25,  # Threshold lebih rendah untuk menangkap lebih banyak teks
-    'min_confidence_for_validation': 0.4,  # Threshold lebih tinggi untuk validasi akhir
-    'max_image_size': (1920, 1080),
-    'min_image_size': (800, 600),
-    
-    # Area crop yang dioptimasi untuk watermark koordinat
-    'crop_areas': {
-        'bottom_right': {
-            'x_start': 0.35,  # Mulai dari 35% lebar gambar
-            'y_start': 0.65,  # Mulai dari 65% tinggi gambar
-            'width': 0.65,    # 65% lebar gambar
-            'height': 0.35    # 35% tinggi gambar
-        },
-        'bottom_center': {
-            'x_start': 0.25,
-            'y_start': 0.75,
-            'width': 0.5,
-            'height': 0.25      
-        },
-        'full_bottom': {
-            'x_start': 0.0,
-            'y_start': 0.7,
-            'width': 1.0,
-            'height': 0.3
+    def __init__(self):
+        # Inisialisasi reader dengan konfigurasi optimal
+        self.reader = easyocr.Reader(
+            ['en'], 
+            gpu=False,
+            verbose=False,
+            download_enabled=True
+        )
+        
+        # Parameter OCR yang dioptimalkan untuk koordinat
+        self.ocr_params = {
+            'width_ths': 0.7,      # Threshold untuk lebar karakter
+            'height_ths': 0.7,     # Threshold untuk tinggi karakter
+            'decoder': 'greedy',   # Decoder yang lebih cepat untuk text sederhana
+            'beamWidth': 5,        # Beam width untuk decoder
+            'batch_size': 1,       # Batch size
+            'workers': 1,          # Jumlah worker
+            'allowlist': '0123456789°\'\"NSEW.,-', # Karakter yang diizinkan
+            'paragraph': False,    # Tidak perlu paragraph detection
+            'x_ths': 1.0,         # Threshold untuk penggabungan text horizontal
+            'y_ths': 0.5,         # Threshold untuk penggabungan text vertical
         }
-    },
     
-    # Preprocessing parameters
-    'preprocessing': {
-        'resize_factor': 2.0,         # Perbesar gambar untuk OCR yang lebih baik
-        'gamma_correction': 1.2,      # Gamma untuk enhance contrast
-        'clahe_clip_limit': 3.0,      # CLAHE untuk adaptive histogram
-        'bilateral_d': 9,             # Bilateral filter parameter
-        'bilateral_sigma_color': 75,
-        'bilateral_sigma_space': 75,
-        'gaussian_blur_kernel': (3, 3),
-        'sharpen_kernel': [[-1,-1,-1], [-1,9,-1], [-1,-1,-1]]
-    }
-}
+    def read_coordinates_optimized(self, image_path: str) -> List[str]:
+        """
+        Baca teks dengan parameter yang dioptimalkan untuk koordinat
+        """
+        try:
+            result = self.reader.readtext(
+                image_path, 
+                detail=0,
+                paragraph=self.ocr_params['paragraph'],
+                width_ths=self.ocr_params['width_ths'],
+                height_ths=self.ocr_params['height_ths'],
+                x_ths=self.ocr_params['x_ths'],
+                y_ths=self.ocr_params['y_ths']
+            )
+            return result
+        except Exception as e:
+            print(f"Error in optimized OCR: {e}")
+            return []
 
-# Enhanced OCR error corrections
-OCR_CORRECTIONS = {
-    # Character substitutions
-    'o': '°',     # o -> degree symbol
-    'O': '°',     # O -> degree symbol  
-    '0': '°',     # 0 -> degree symbol (dalam konteks koordinat)
-    '`': "'",     # backtick -> apostrophe
-    ''': "'",     # right single quotation -> apostrophe
-    ''': "'",     # left single quotation -> apostrophe
-    '″': '"',     # double prime -> quotation mark
-    '′': "'",     # prime -> apostrophe
-    '"': '"',     # left double quote -> standard quote
-    '"': '"',     # right double quote -> standard quote
-    
-    # Decimal separators (Indonesia uses comma)
-    '.': ',',     # dot -> comma untuk desimal Indonesia
-    
-    # Direction indicators
-    'S ': 'S',    # Remove extra space after S
-    'E ': 'E',    # Remove extra space after E
-    ' S': 'S',    # Remove space before S
-    ' E': 'E',    # Remove space before E
-    
-    # Common OCR mistakes for numbers in coordinates
-    'l': '1',     # lowercase L -> 1
-    'I': '1',     # uppercase i -> 1
-    'O': '0',     # O -> 0 (dalam konteks angka)
-    'S': '5',     # S -> 5 (dalam konteks angka, hati-hati dengan direction)
-}
-
-# Whitelist karakter yang valid untuk koordinat
-VALID_COORDINATE_CHARS = set('0123456789°\'",SE ')
-
-def validate_coordinate_bounds(lat: float, lon: float) -> dict:
+def enhance_image_for_coordinates(image_path: str) -> str:
     """
-    Validasi koordinat dengan berbagai tingkatan
-    Returns dict dengan informasi validasi
+    Enhancement gambar yang lebih agresif untuk koordinat
     """
-    result = {
-        'valid': False,
-        'region': 'unknown',
-        'confidence': 0.0,
-        'warnings': []
-    }
-    
     try:
-        # Level 1: Indonesia bounds
-        if (INDONESIA_BOUNDS['lat_min'] <= lat <= INDONESIA_BOUNDS['lat_max'] and
-            INDONESIA_BOUNDS['lon_min'] <= lon <= INDONESIA_BOUNDS['lon_max']):
-            
-            result['valid'] = True
-            result['region'] = 'Indonesia'
-            result['confidence'] = 0.6
-            
-            # Level 2: West Java bounds (higher confidence)
-            if (WEST_JAVA_BOUNDS['lat_min'] <= lat <= WEST_JAVA_BOUNDS['lat_max'] and
-                WEST_JAVA_BOUNDS['lon_min'] <= lon <= WEST_JAVA_BOUNDS['lon_max']):
-                
-                result['region'] = 'West Java'
-                result['confidence'] = 0.8
-                
-                # Level 3: Bandung bounds (highest confidence)
-                if (BANDUNG_BOUNDS['lat_min'] <= lat <= BANDUNG_BOUNDS['lat_max'] and
-                    BANDUNG_BOUNDS['lon_min'] <= lon <= BANDUNG_BOUNDS['lon_max']):
-                    
-                    result['region'] = 'Bandung Area'
-                    result['confidence'] = 0.95
-            
-        else:
-            result['warnings'].append(f"Coordinates outside Indonesia bounds: {lat}, {lon}")
-            
-        return result
+        # Baca gambar
+        img = cv2.imread(image_path)
+        if img is None:
+            return image_path
+        
+        # Convert ke grayscale
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # 1. Gaussian blur untuk mengurangi noise
+        blurred = cv2.GaussianBlur(gray, (3, 3), 0)
+        
+        # 2. Adaptive threshold dengan parameter yang dioptimalkan
+        thresh = cv2.adaptiveThreshold(
+            blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY, 15, 4
+        )
+        
+        # 3. Morphological operations untuk membersihkan noise
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+        cleaned = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
+        
+        # 4. Sharpening untuk memperjelas karakter
+        kernel_sharp = np.array([[-1,-1,-1], 
+                                [-1, 9,-1], 
+                                [-1,-1,-1]])
+        sharpened = cv2.filter2D(cleaned, -1, kernel_sharp)
+        
+        # 5. Resize gambar untuk meningkatkan resolusi
+        height, width = sharpened.shape
+        new_width = int(width * 2)
+        new_height = int(height * 2)
+        resized = cv2.resize(sharpened, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+        
+        # Simpan hasil enhancement
+        enhanced_path = image_path.replace('.', '_enhanced.')
+        cv2.imwrite(enhanced_path, resized)
+        
+        return enhanced_path
         
     except Exception as e:
-        result['warnings'].append(f"Validation error: {str(e)}")
-        return result
+        print(f"Error in image enhancement: {e}")
+        return image_path
 
-# Retry configuration untuk different OCR strategies
-RETRY_STRATEGIES = [
-    {
-        'name': 'high_accuracy',
-        'params': {
-            'det_limit_side_len': 1280,
-            'drop_score': 0.2,
-            'rec_batch_num': 1
-        }
-    },
-    {
-        'name': 'high_recall', 
-        'params': {
-            'det_limit_side_len': 640,
-            'drop_score': 0.4,
-            'rec_batch_num': 10
-        }
-    },
-    {
-        'name': 'balanced',
-        'params': {
-            'det_limit_side_len': 960,
-            'drop_score': 0.3,
-            'rec_batch_num': 6
-        }
-    }
-]
+def segment_coordinate_region(image_path: str) -> List[str]:
+    """
+    Segmentasi region yang kemungkinan mengandung koordinat
+    """
+    try:
+        img = cv2.imread(image_path)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        
+        # Deteksi kontur untuk menemukan area text
+        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY_INV, 11, 2)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        segments = []
+        
+        for i, contour in enumerate(contours):
+            # Filter contour berdasarkan area dan aspect ratio
+            area = cv2.contourArea(contour)
+            if area > 100:  # Minimum area
+                x, y, w, h = cv2.boundingRect(contour)
+                aspect_ratio = w / h
+                
+                # Area yang kemungkinan mengandung koordinat (horizontal text)
+                if 2 < aspect_ratio < 20 and w > 50:
+                    # Crop region
+                    roi = img[y:y+h, x:x+w]
+                    segment_path = image_path.replace('.', f'_segment_{i}.')
+                    cv2.imwrite(segment_path, roi)
+                    segments.append(segment_path)
+        
+        return segments
+        
+    except Exception as e:
+        print(f"Error in segmentation: {e}")
+        return [image_path]
+
+# Fungsi utilitas tambahan
+def validate_dms_format(coord_str: str) -> bool:
+    """
+    Validasi format DMS (Degrees Minutes Seconds)
+    """
+    pattern = r'^\d{1,3}°\s*\d{1,2}\'\s*\d{1,2}(?:\.\d+)?\"\s*[NSEW]$'
+    return bool(re.match(pattern, coord_str.strip()))
+
+def convert_dms_to_decimal(dms_str: str) -> float:
+    """
+    Konversi DMS ke decimal degrees untuk validasi
+    """
+    try:
+        import re
+        parts = re.findall(r'(\d+(?:\.\d+)?)', dms_str)
+        direction = re.findall(r'[NSEW]', dms_str.upper())[0]
+        
+        if len(parts) >= 3:
+            degrees = float(parts[0])
+            minutes = float(parts[1])
+            seconds = float(parts[2])
+            
+            decimal = degrees + (minutes / 60) + (seconds / 3600)
+            
+            # Negative untuk South dan West
+            if direction in ['S', 'W']:
+                decimal = -decimal
+                
+            return decimal
+        return 0.0
+    except:
+        return 0.0
+
+def is_coordinate_in_indonesia(lat_str: str, lon_str: str) -> bool:
+    """
+    Validasi apakah koordinat berada di wilayah Indonesia
+    """
+    try:
+        lat_decimal = convert_dms_to_decimal(lat_str)
+        lon_decimal = convert_dms_to_decimal(lon_str)
+        
+        # Batas wilayah Indonesia (approximate)
+        # Latitude: 6°N to 11°S
+        # Longitude: 95°E to 141°E
+        if -11 <= lat_decimal <= 6 and 95 <= lon_decimal <= 141:
+            return True
+        return False
+    except:
+        return False

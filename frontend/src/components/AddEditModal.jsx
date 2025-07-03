@@ -1,5 +1,6 @@
 import { useState } from "react";
 
+
 const AddEditModal = ({ initialData, onSave, onClose }) => {
   const [form, setForm] = useState({
     jalur: initialData?.jalur || "",
@@ -7,6 +8,28 @@ const AddEditModal = ({ initialData, onSave, onClose }) => {
     keterangan: initialData?.keterangan || "",
     foto: initialData?.foto || null,
   });
+  
+  // ✅ TAMBAHAN: Loading state
+  const [isLoading, setIsLoading] = useState(false);
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (!form.foto) {
+      alert("Silakan upload foto.");
+      return;
+    }
+    
+    // ✅ Set loading state
+    setIsLoading(true);
+    
+    try {
+      await onSave(form);
+    } catch (error) {
+      console.error("Error saving data:", error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
 
   const handleChange = (e) => {
     const { name, value, files } = e.target;
@@ -17,14 +40,7 @@ const AddEditModal = ({ initialData, onSave, onClose }) => {
     }
   };
 
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    if (!form.foto) {
-      alert("Silakan upload foto.");
-      return;
-    }
-    onSave(form);
-  };
+  
 
   const getKondisiColor = (kondisi) => {
     switch (kondisi) {
@@ -162,14 +178,28 @@ const AddEditModal = ({ initialData, onSave, onClose }) => {
               Batal
             </button>
             <button
-              type="submit"
-              className="px-6 py-3 bg-gradient-to-r from-green-600 to-green-700 text-white rounded-xl hover:from-green-700 hover:to-green-800 transition-all duration-200 font-medium shadow-lg hover:shadow-xl flex items-center space-x-2"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
-              </svg>
-              <span>Simpan Data</span>
-            </button>
+    type="submit"
+    disabled={isLoading}
+    className={`px-6 py-3 rounded-xl font-medium shadow-lg hover:shadow-xl flex items-center space-x-2 transition-all duration-200 ${
+      isLoading 
+        ? 'bg-gray-400 cursor-not-allowed' 
+        : 'bg-gradient-to-r from-green-600 to-green-700 text-white hover:from-green-700 hover:to-green-800'
+    }`}
+  >
+    {isLoading ? (
+      <>
+        <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+        <span>Menyimpan...</span>
+      </>
+    ) : (
+      <>
+        <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+        </svg>
+        <span>Simpan Data</span>
+      </>
+    )}
+  </button>
           </div>
         </form>
       </div>

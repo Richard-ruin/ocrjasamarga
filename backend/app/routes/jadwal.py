@@ -1,523 +1,383 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
-from typing import Optional, List
-from datetime import datetime, date
+# app/routes/jadwal.py
+from fastapi import APIRouter, HTTPException, Depends, status
+from typing import List, Optional
+from datetime import datetime, date, time
 from bson import ObjectId
+from pydantic import BaseModel, Field, ValidationError
 
-from ..auth.auth import get_current_admin
-from ..models.jadwal import JadwalCreate, JadwalUpdate, JadwalResponse, JadwalInDB
-from ..database import get_database
-from ..utils.helpers import create_response, convert_objectid_to_str, paginate_results
-from ..utils.validators import validate_alamat, validate_full_name, validate_date_range, validate_time_format, validate_status
+from app.routes.auth import get_current_admin
+from app.config import db
 
-router = APIRouter(prefix="/jadwal", tags=["Jadwal"])
+router = APIRouter()
 
-@router.post("/", response_model=dict)
+# Collections
+jadwal_collection = db["jadwal"]
+
+class JadwalCreate(BaseModel):
+    nama_inspektur: str = Field(..., min_length=2, max_length=100)
+    tanggal: date
+    waktu: time
+    alamat: str = Field(..., min_length=5, max_length=500)
+    keterangan: Optional[str] = None
+    status: str = Field(default="scheduled")  # scheduled, completed, cancelled
+
+class JadwalUpdate(BaseModel):
+    nama_inspektur: Optional[str] = None
+    tanggal: Optional[date] = None
+    waktu: Optional[time] = None
+    alamat: Optional[str] = None
+    keterangan: Optional[str] = None
+    status: Optional[str] = None
+
+class JadwalResponse(BaseModel):
+    id: str = Field(alias="_id")
+    nama_inspektur: str
+    tanggal: str  # Changed to string for JSON compatibility
+    waktu: str    # Changed to string for JSON compatibility
+    alamat: str
+    keterangan: Optional[str] = None
+    status: str
+    admin_id: str
+    created_at: datetime
+    updated_at: Optional[datetime] = None
+    
+    class Config:
+        populate_by_name = True
+        json_encoders = {
+            ObjectId: str,
+            datetime: lambda v: v.isoformat()
+        }
+
+def convert_jadwal_for_response(jadwal_doc):
+    """Convert jadwal document for API response"""
+    if isinstance(jadwal_doc.get("tanggal"), date):
+        jadwal_doc["tanggal"] = jadwal_doc["tanggal"].isoformat()
+    if isinstance(jadwal_doc.get("waktu"), time):
+        jadwal_doc["waktu"] = jadwal_doc["waktu"].isoformat()
+    return jadwal_doc
+
+def convert_jadwal_for_storage(jadwal_data):
+    """Convert jadwal data for MongoDB storage"""
+    storage_data = jadwal_data.copy()
+    
+    # Convert date and time to strings for MongoDB storage
+    if isinstance(storage_data.get("tanggal"), date):
+        storage_data["tanggal"] = storage_data["tanggal"].isoformat()
+    if isinstance(storage_data.get("waktu"), time):
+        storage_data["waktu"] = storage_data["waktu"].isoformat()
+        
+    return storage_data
+
+@router.get("/jadwal", response_model=List[JadwalResponse])
+async def get_all_jadwal(current_admin: dict = Depends(get_current_admin)):
+    """Ambil semua jadwal inspeksi"""
+    try:
+        jadwal_list = list(jadwal_collection.find({"admin_id": str(current_admin["_id"])}))
+        
+        # Convert ObjectId to string dan format tanggal
+        result = []
+        for jadwal in jadwal_list:
+            jadwal["_id"] = str(jadwal["_id"])
+            jadwal = convert_jadwal_for_response(jadwal)
+            result.append(jadwal)
+            
+        return result
+    except Exception as e:
+        print(f"Error fetching jadwal: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch jadwal: {str(e)}"
+        )
+
+@router.get("/jadwal/{jadwal_id}", response_model=JadwalResponse)
+async def get_jadwal_by_id(
+    jadwal_id: str, 
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Ambil jadwal berdasarkan ID"""
+    try:
+        object_id = ObjectId(jadwal_id)
+        jadwal = jadwal_collection.find_one({
+            "_id": object_id,
+            "admin_id": str(current_admin["_id"])
+        })
+        
+        if not jadwal:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Jadwal not found"
+            )
+        
+        jadwal["_id"] = str(jadwal["_id"])
+        jadwal = convert_jadwal_for_response(jadwal)
+        return jadwal
+        
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid jadwal ID format"
+        )
+    except Exception as e:
+        print(f"Error fetching jadwal by ID: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch jadwal: {str(e)}"
+        )
+
+@router.post("/jadwal", response_model=JadwalResponse)
 async def create_jadwal(
     jadwal_data: JadwalCreate,
     current_admin: dict = Depends(get_current_admin)
 ):
-    """Create jadwal inspeksi baru"""
+    """Buat jadwal inspeksi baru"""
     try:
-        db = get_database()
-        admin_id = str(current_admin["_id"])
-        
-        # Validasi input
-        name_valid, name_msg = validate_full_name(jadwal_data.nama_inspektur)
-        if not name_valid:
-            raise HTTPException(status_code=400, detail=name_msg)
-        
-        alamat_valid, alamat_msg = validate_alamat(jadwal_data.alamat)
-        if not alamat_valid:
-            raise HTTPException(status_code=400, detail=alamat_msg)
-        
-        time_valid, time_msg = validate_time_format(jadwal_data.waktu.isoformat())
-        if not time_valid:
-            raise HTTPException(status_code=400, detail=time_msg)
-        
-        # Validasi tanggal tidak boleh di masa lalu
-        if jadwal_data.tanggal < date.today():
+        # Validasi status
+        valid_status = ["scheduled", "completed", "cancelled"]
+        if jadwal_data.status not in valid_status:
             raise HTTPException(
-                status_code=400,
-                detail="Tanggal jadwal tidak boleh di masa lalu"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Status must be one of: {valid_status}"
             )
         
-        # Check duplikasi jadwal pada tanggal dan waktu yang sama untuk admin
-        existing_jadwal = await db.jadwal.find_one({
-            "admin_id": admin_id,
-            "tanggal": jadwal_data.tanggal,
-            "waktu": jadwal_data.waktu.isoformat()
-        })
+        # Convert Pydantic model to dict
+        jadwal_dict = jadwal_data.dict()
         
-        if existing_jadwal:
+        # Buat document jadwal dengan konversi format
+        jadwal_doc = {
+            "nama_inspektur": jadwal_dict["nama_inspektur"],
+            "tanggal": jadwal_dict["tanggal"].isoformat(),  # Convert to string
+            "waktu": jadwal_dict["waktu"].isoformat(),      # Convert to string  
+            "alamat": jadwal_dict["alamat"],
+            "keterangan": jadwal_dict["keterangan"],
+            "status": jadwal_dict["status"],
+            "admin_id": str(current_admin["_id"]),
+            "created_at": datetime.utcnow(),
+            "updated_at": None
+        }
+        
+        print(f"Saving jadwal document: {jadwal_doc}")  # Debug log
+        
+        # Simpan ke database
+        result = jadwal_collection.insert_one(jadwal_doc)
+        
+        if result.inserted_id:
+            # Ambil data yang baru disimpan
+            saved_jadwal = jadwal_collection.find_one({"_id": result.inserted_id})
+            saved_jadwal["_id"] = str(saved_jadwal["_id"])
+            
+            return saved_jadwal
+        else:
             raise HTTPException(
-                status_code=400,
-                detail="Sudah ada jadwal pada tanggal dan waktu tersebut"
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create jadwal"
             )
-        
-        # Create jadwal document
-        jadwal_doc = JadwalInDB(
-            nama_inspektur=jadwal_data.nama_inspektur,
-            tanggal=jadwal_data.tanggal,
-            waktu=jadwal_data.waktu,
-            alamat=jadwal_data.alamat,
-            keterangan=jadwal_data.keterangan,
-            status=jadwal_data.status,
-            admin_id=admin_id
-        )
-        
-        # Insert to database
-        result = await db.jadwal.insert_one(jadwal_doc.model_dump())
-        
-        # Get created jadwal
-        created_jadwal = await db.jadwal.find_one({"_id": result.inserted_id})
-        
-        # Convert untuk response
-        jadwal_response = JadwalResponse(
-            _id=str(created_jadwal["_id"]),
-            nama_inspektur=created_jadwal["nama_inspektur"],
-            tanggal=created_jadwal["tanggal"],
-            waktu=created_jadwal["waktu"],
-            alamat=created_jadwal["alamat"],
-            keterangan=created_jadwal.get("keterangan"),
-            status=created_jadwal["status"],
-            admin_id=created_jadwal["admin_id"],
-            created_at=created_jadwal["created_at"]
-        )
-        
-        return create_response(
-            success=True,
-            message="Jadwal berhasil dibuat",
-            data=jadwal_response.model_dump()
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal membuat jadwal: {str(e)}"
-        )
-
-@router.get("/", response_model=dict)
-async def get_jadwal_list(
-    page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=100),
-    status: Optional[str] = Query(None),
-    start_date: Optional[date] = Query(None),
-    end_date: Optional[date] = Query(None),
-    search: Optional[str] = Query(None),
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Get list jadwal dengan pagination dan filter"""
-    try:
-        db = get_database()
-        admin_id = str(current_admin["_id"])
-        
-        # Build query
-        query = {"admin_id": admin_id}
-        
-        # Filter by status
-        if status:
-            allowed_statuses = ["scheduled", "completed", "cancelled"]
-            status_valid, status_msg = validate_status(status, allowed_statuses)
-            if not status_valid:
-                raise HTTPException(status_code=400, detail=status_msg)
-            query["status"] = status
-        
-        # Filter by date range
-        if start_date or end_date:
-            date_filter = {}
-            if start_date:
-                date_filter["$gte"] = start_date
-            if end_date:
-                date_filter["$lte"] = end_date
             
-            if start_date and end_date:
-                date_valid, date_msg = validate_date_range(start_date, end_date)
-                if not date_valid:
-                    raise HTTPException(status_code=400, detail=date_msg)
-            
-            query["tanggal"] = date_filter
-        
-        # Search in nama_inspektur or alamat
-        if search:
-            query["$or"] = [
-                {"nama_inspektur": {"$regex": search, "$options": "i"}},
-                {"alamat": {"$regex": search, "$options": "i"}}
-            ]
-        
-        # Get total count
-        total_count = await db.jadwal.count_documents(query)
-        
-        # Get paginated results
-        skip = (page - 1) * limit
-        jadwal_list = []
-        
-        async for jadwal in db.jadwal.find(query).sort("tanggal", -1).skip(skip).limit(limit):
-            jadwal_response = JadwalResponse(
-                _id=str(jadwal["_id"]),
-                nama_inspektur=jadwal["nama_inspektur"],
-                tanggal=jadwal["tanggal"],
-                waktu=jadwal["waktu"],
-                alamat=jadwal["alamat"],
-                keterangan=jadwal.get("keterangan"),
-                status=jadwal["status"],
-                admin_id=jadwal["admin_id"],
-                created_at=jadwal["created_at"],
-                updated_at=jadwal.get("updated_at")
-            )
-            jadwal_list.append(jadwal_response.model_dump())
-        
-        # Calculate pagination info
-        total_pages = (total_count + limit - 1) // limit
-        
-        return create_response(
-            success=True,
-            message="List jadwal berhasil diambil",
-            data={
-                "jadwal": jadwal_list,
-                "pagination": {
-                    "current_page": page,
-                    "total_pages": total_pages,
-                    "total_items": total_count,
-                    "items_per_page": limit,
-                    "has_next": page < total_pages,
-                    "has_prev": page > 1
-                }
-            }
+    except ValidationError as e:
+        print(f"Validation error: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Validation error: {str(e)}"
         )
-        
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Error creating jadwal: {e}")
         raise HTTPException(
-            status_code=500,
-            detail=f"Gagal mengambil list jadwal: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create jadwal: {str(e)}"
         )
 
-@router.get("/{jadwal_id}", response_model=dict)
-async def get_jadwal_detail(
-    jadwal_id: str,
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Get detail jadwal by ID"""
-    try:
-        db = get_database()
-        admin_id = str(current_admin["_id"])
-        
-        # Validate ObjectId
-        if not ObjectId.is_valid(jadwal_id):
-            raise HTTPException(status_code=400, detail="Invalid jadwal ID")
-        
-        # Get jadwal
-        jadwal = await db.jadwal.find_one({
-            "_id": ObjectId(jadwal_id),
-            "admin_id": admin_id
-        })
-        
-        if not jadwal:
-            raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
-        
-        # Convert untuk response
-        jadwal_response = JadwalResponse(
-            _id=str(jadwal["_id"]),
-            nama_inspektur=jadwal["nama_inspektur"],
-            tanggal=jadwal["tanggal"],
-            waktu=jadwal["waktu"],
-            alamat=jadwal["alamat"],
-            keterangan=jadwal.get("keterangan"),
-            status=jadwal["status"],
-            admin_id=jadwal["admin_id"],
-            created_at=jadwal["created_at"],
-            updated_at=jadwal.get("updated_at")
-        )
-        
-        return create_response(
-            success=True,
-            message="Detail jadwal berhasil diambil",
-            data=jadwal_response.model_dump()
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal mengambil detail jadwal: {str(e)}"
-        )
-
-@router.put("/{jadwal_id}", response_model=dict)
+@router.put("/jadwal/{jadwal_id}", response_model=JadwalResponse)
 async def update_jadwal(
     jadwal_id: str,
-    jadwal_update: JadwalUpdate,
+    jadwal_data: JadwalUpdate,
     current_admin: dict = Depends(get_current_admin)
 ):
-    """Update jadwal by ID"""
+    """Update jadwal inspeksi"""
     try:
-        db = get_database()
-        admin_id = str(current_admin["_id"])
+        object_id = ObjectId(jadwal_id)
         
-        # Validate ObjectId
-        if not ObjectId.is_valid(jadwal_id):
-            raise HTTPException(status_code=400, detail="Invalid jadwal ID")
-        
-        # Check if jadwal exists and belongs to admin
-        existing_jadwal = await db.jadwal.find_one({
-            "_id": ObjectId(jadwal_id),
-            "admin_id": admin_id
+        # Cek apakah jadwal ada dan milik admin yang sedang login
+        existing_jadwal = jadwal_collection.find_one({
+            "_id": object_id,
+            "admin_id": str(current_admin["_id"])
         })
         
         if not existing_jadwal:
-            raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Jadwal not found"
+            )
         
-        # Prepare update data
+        # Siapkan data update (hanya field yang tidak None)
         update_data = {}
+        jadwal_dict = jadwal_data.dict(exclude_unset=True)
         
-        # Validasi dan update fields yang diberikan
-        if jadwal_update.nama_inspektur is not None:
-            name_valid, name_msg = validate_full_name(jadwal_update.nama_inspektur)
-            if not name_valid:
-                raise HTTPException(status_code=400, detail=name_msg)
-            update_data["nama_inspektur"] = jadwal_update.nama_inspektur
-        
-        if jadwal_update.alamat is not None:
-            alamat_valid, alamat_msg = validate_alamat(jadwal_update.alamat)
-            if not alamat_valid:
-                raise HTTPException(status_code=400, detail=alamat_msg)
-            update_data["alamat"] = jadwal_update.alamat
-        
-        if jadwal_update.tanggal is not None:
-            if jadwal_update.tanggal < date.today():
-                raise HTTPException(
-                    status_code=400,
-                    detail="Tanggal jadwal tidak boleh di masa lalu"
-                )
-            update_data["tanggal"] = jadwal_update.tanggal
-        
-        if jadwal_update.waktu is not None:
-            time_valid, time_msg = validate_time_format(jadwal_update.waktu.isoformat())
-            if not time_valid:
-                raise HTTPException(status_code=400, detail=time_msg)
-            update_data["waktu"] = jadwal_update.waktu
-        
-        if jadwal_update.status is not None:
-            allowed_statuses = ["scheduled", "completed", "cancelled"]
-            status_valid, status_msg = validate_status(jadwal_update.status, allowed_statuses)
-            if not status_valid:
-                raise HTTPException(status_code=400, detail=status_msg)
-            update_data["status"] = jadwal_update.status
-        
-        if jadwal_update.keterangan is not None:
-            update_data["keterangan"] = jadwal_update.keterangan
-        
-        # Check duplikasi jika tanggal atau waktu diubah
-        if "tanggal" in update_data or "waktu" in update_data:
-            check_tanggal = update_data.get("tanggal", existing_jadwal["tanggal"])
-            check_waktu = update_data.get("waktu", existing_jadwal["waktu"])
-            
-            duplicate_jadwal = await db.jadwal.find_one({
-                "_id": {"$ne": ObjectId(jadwal_id)},
-                "admin_id": admin_id,
-                "tanggal": check_tanggal,
-                "waktu": check_waktu.isoformat() if hasattr(check_waktu, 'isoformat') else check_waktu
-            })
-            
-            if duplicate_jadwal:
-                raise HTTPException(
-                    status_code=400,
-                    detail="Sudah ada jadwal pada tanggal dan waktu tersebut"
-                )
+        for key, value in jadwal_dict.items():
+            if value is not None:
+                if key == "tanggal" and isinstance(value, date):
+                    update_data[key] = value.isoformat()
+                elif key == "waktu" and isinstance(value, time):
+                    update_data[key] = value.isoformat()
+                elif key == "status":
+                    # Validasi status
+                    valid_status = ["scheduled", "completed", "cancelled"]
+                    if value not in valid_status:
+                        raise HTTPException(
+                            status_code=status.HTTP_400_BAD_REQUEST,
+                            detail=f"Status must be one of: {valid_status}"
+                        )
+                    update_data[key] = value
+                else:
+                    update_data[key] = value
         
         if not update_data:
             raise HTTPException(
-                status_code=400,
-                detail="Tidak ada data yang diupdate"
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No data provided for update"
             )
         
-        # Add updated timestamp
+        # Tambahkan updated_at
         update_data["updated_at"] = datetime.utcnow()
         
-        # Update jadwal
-        await db.jadwal.update_one(
-            {"_id": ObjectId(jadwal_id)},
+        print(f"Updating jadwal with: {update_data}")  # Debug log
+        
+        # Update di database
+        result = jadwal_collection.update_one(
+            {"_id": object_id},
             {"$set": update_data}
         )
         
-        # Get updated jadwal
-        updated_jadwal = await db.jadwal.find_one({"_id": ObjectId(jadwal_id)})
-        
-        # Convert untuk response
-        jadwal_response = JadwalResponse(
-            _id=str(updated_jadwal["_id"]),
-            nama_inspektur=updated_jadwal["nama_inspektur"],
-            tanggal=updated_jadwal["tanggal"],
-            waktu=updated_jadwal["waktu"],
-            alamat=updated_jadwal["alamat"],
-            keterangan=updated_jadwal.get("keterangan"),
-            status=updated_jadwal["status"],
-            admin_id=updated_jadwal["admin_id"],
-            created_at=updated_jadwal["created_at"],
-            updated_at=updated_jadwal.get("updated_at")
+        if result.modified_count > 0:
+            # Ambil data terbaru
+            updated_jadwal = jadwal_collection.find_one({"_id": object_id})
+            updated_jadwal["_id"] = str(updated_jadwal["_id"])
+            return updated_jadwal
+        else:
+            # Mungkin tidak ada perubahan, return data existing
+            existing_jadwal["_id"] = str(existing_jadwal["_id"])
+            return existing_jadwal
+            
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid jadwal ID format"
         )
-        
-        return create_response(
-            success=True,
-            message="Jadwal berhasil diupdate",
-            data=jadwal_response.model_dump()
-        )
-        
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Error updating jadwal: {e}")
         raise HTTPException(
-            status_code=500,
-            detail=f"Gagal mengupdate jadwal: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update jadwal: {str(e)}"
         )
 
-@router.delete("/{jadwal_id}", response_model=dict)
+@router.delete("/jadwal/{jadwal_id}")
 async def delete_jadwal(
     jadwal_id: str,
     current_admin: dict = Depends(get_current_admin)
 ):
-    """Delete jadwal by ID"""
+    """Hapus jadwal inspeksi"""
     try:
-        db = get_database()
-        admin_id = str(current_admin["_id"])
+        object_id = ObjectId(jadwal_id)
         
-        # Validate ObjectId
-        if not ObjectId.is_valid(jadwal_id):
-            raise HTTPException(status_code=400, detail="Invalid jadwal ID")
-        
-        # Check if jadwal exists and belongs to admin
-        existing_jadwal = await db.jadwal.find_one({
-            "_id": ObjectId(jadwal_id),
-            "admin_id": admin_id
+        # Cek apakah jadwal ada dan milik admin yang sedang login
+        existing_jadwal = jadwal_collection.find_one({
+            "_id": object_id,
+            "admin_id": str(current_admin["_id"])
         })
         
         if not existing_jadwal:
-            raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
-        
-        # Check if there are inspeksi linked to this jadwal
-        linked_inspeksi = await db.inspeksi.find_one({"jadwal_id": jadwal_id})
-        if linked_inspeksi:
             raise HTTPException(
-                status_code=400,
-                detail="Tidak dapat menghapus jadwal yang sudah memiliki data inspeksi"
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Jadwal not found"
             )
         
-        # Delete jadwal
-        result = await db.jadwal.delete_one({"_id": ObjectId(jadwal_id)})
+        # Hapus dari database
+        result = jadwal_collection.delete_one({"_id": object_id})
         
-        if result.deleted_count == 0:
-            raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
-        
-        return create_response(
-            success=True,
-            message="Jadwal berhasil dihapus"
+        if result.deleted_count > 0:
+            return {"message": "Jadwal berhasil dihapus"}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to delete jadwal"
+            )
+            
+    except ValueError:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Invalid jadwal ID format"
         )
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error deleting jadwal: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete jadwal: {str(e)}"
+        )
+
+@router.get("/jadwal/status/{status}")
+async def get_jadwal_by_status(
+    status: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Ambil jadwal berdasarkan status"""
+    try:
+        valid_status = ["scheduled", "completed", "cancelled"]
+        if status not in valid_status:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Status must be one of: {valid_status}"
+            )
+        
+        jadwal_list = list(jadwal_collection.find({
+            "admin_id": str(current_admin["_id"]),
+            "status": status
+        }))
+        
+        # Convert ObjectId to string dan format tanggal
+        result = []
+        for jadwal in jadwal_list:
+            jadwal["_id"] = str(jadwal["_id"])
+            jadwal = convert_jadwal_for_response(jadwal)
+            result.append(jadwal)
+            
+        return result
         
     except HTTPException:
         raise
     except Exception as e:
+        print(f"Error fetching jadwal by status: {e}")
         raise HTTPException(
-            status_code=500,
-            detail=f"Gagal menghapus jadwal: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch jadwal by status: {str(e)}"
         )
 
-@router.get("/upcoming/list", response_model=dict)
-async def get_upcoming_jadwal(
-    limit: int = Query(5, ge=1, le=20),
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Get upcoming jadwal (jadwal yang akan datang)"""
+@router.get("/jadwal/today")
+async def get_jadwal_today(current_admin: dict = Depends(get_current_admin)):
+    """Ambil jadwal hari ini"""
     try:
-        db = get_database()
-        admin_id = str(current_admin["_id"])
+        today = datetime.now().date().isoformat()  # Convert to string
         
-        # Get jadwal yang tanggalnya >= hari ini dan status scheduled
-        today = date.today()
+        jadwal_list = list(jadwal_collection.find({
+            "admin_id": str(current_admin["_id"]),
+            "tanggal": today
+        }))
         
-        jadwal_list = []
-        async for jadwal in db.jadwal.find({
-            "admin_id": admin_id,
-            "tanggal": {"$gte": today},
-            "status": "scheduled"
-        }).sort("tanggal", 1).limit(limit):
-            jadwal_response = JadwalResponse(
-                _id=str(jadwal["_id"]),
-                nama_inspektur=jadwal["nama_inspektur"],
-                tanggal=jadwal["tanggal"],
-                waktu=jadwal["waktu"],
-                alamat=jadwal["alamat"],
-                keterangan=jadwal.get("keterangan"),
-                status=jadwal["status"],
-                admin_id=jadwal["admin_id"],
-                created_at=jadwal["created_at"],
-                updated_at=jadwal.get("updated_at")
-            )
-            jadwal_list.append(jadwal_response.model_dump())
-        
-        return create_response(
-            success=True,
-            message="Upcoming jadwal berhasil diambil",
-            data=jadwal_list
-        )
+        # Convert ObjectId to string dan format tanggal
+        result = []
+        for jadwal in jadwal_list:
+            jadwal["_id"] = str(jadwal["_id"])
+            jadwal = convert_jadwal_for_response(jadwal)
+            result.append(jadwal)
+            
+        return result
         
     except Exception as e:
+        print(f"Error fetching today's jadwal: {e}")
         raise HTTPException(
-            status_code=500,
-            detail=f"Gagal mengambil upcoming jadwal: {str(e)}"
-        )
-
-@router.post("/{jadwal_id}/complete", response_model=dict)
-async def complete_jadwal(
-    jadwal_id: str,
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Mark jadwal as completed"""
-    try:
-        db = get_database()
-        admin_id = str(current_admin["_id"])
-        
-        # Validate ObjectId
-        if not ObjectId.is_valid(jadwal_id):
-            raise HTTPException(status_code=400, detail="Invalid jadwal ID")
-        
-        # Check if jadwal exists and belongs to admin
-        existing_jadwal = await db.jadwal.find_one({
-            "_id": ObjectId(jadwal_id),
-            "admin_id": admin_id
-        })
-        
-        if not existing_jadwal:
-            raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
-        
-        if existing_jadwal["status"] == "completed":
-            raise HTTPException(
-                status_code=400,
-                detail="Jadwal sudah dalam status completed"
-            )
-        
-        # Update status to completed
-        await db.jadwal.update_one(
-            {"_id": ObjectId(jadwal_id)},
-            {
-                "$set": {
-                    "status": "completed",
-                    "updated_at": datetime.utcnow()
-                }
-            }
-        )
-        
-        return create_response(
-            success=True,
-            message="Jadwal berhasil ditandai sebagai completed"
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal mengupdate status jadwal: {str(e)}"
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch today's jadwal: {str(e)}"
         )

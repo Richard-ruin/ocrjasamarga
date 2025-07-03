@@ -1,367 +1,413 @@
-import { useState } from "react";
+// src/pages/Dashboard.jsx - Perbaikan error handling dan token
+import { useState, useEffect } from "react";
+import { Link } from "react-router-dom";
 import AdminLayout from "../components/AdminLayout";
-import AddEditModal from "../components/AddEditModal";
-import ConfirmModal from "../components/ConfirmModal";
+import { useAuth } from "../context/AuthContext";
+import { useNotification } from "../context/NotificationContext";
 import axios from "axios";
-import dayjs from "dayjs";
 
 const Dashboard = () => {
-  const [data, setData] = useState([]);
-  const [showModal, setShowModal] = useState(false);
-  const [showConfirmModal, setShowConfirmModal] = useState(false);
-  const [editIndex, setEditIndex] = useState(null);
-  const [deleteIndex, setDeleteIndex] = useState(null);
-  const [isGenerating, setIsGenerating] = useState(false);
+  const { user, logout } = useAuth();
+  const { error, success } = useNotification();
+  const [stats, setStats] = useState({
+    jadwal: { total: 0, scheduled: 0, completed: 0, cancelled: 0, today: 0 },
+    inspeksi: { total: 0, draft: 0, generated: 0, saved: 0 },
+    history: { total: 0, this_week: 0 },
+    recent_activities: { jadwal: [], inspeksi: [] }
+  });
+  const [loading, setLoading] = useState(true);
 
-  const handleEdit = (index) => {
-    setEditIndex(index);
-    setShowModal(true);
-  };
-
-  const handleDeleteClick = (index) => {
-    setDeleteIndex(index);
-    setShowConfirmModal(true);
-  };
-
-  const handleDelete = () => {
-    const newData = [...data];
-    newData.splice(deleteIndex, 1);
-    setData(newData);
-    setShowConfirmModal(false);
-    setDeleteIndex(null);
-  };
-
-  const handleSave = (entry) => {
-    if (editIndex !== null) {
-      const newData = [...data];
-      newData[editIndex] = entry;
-      setData(newData);
-    } else {
-      setData([...data, entry]);
-    }
-    setShowModal(false);
-    setEditIndex(null);
-  };
-
-  const handleSaveData = async () => {
-    if (data.length === 0) {
-      alert("Tidak ada data untuk disimpan.");
-      return;
-    }
-
-    const formData = new FormData();
-    data.forEach((item, i) => {
-      formData.append("entries", JSON.stringify({
-        no: i + 1,
-        jalur: item.jalur,
-        kondisi: item.kondisi,
-        keterangan: item.keterangan
-      }));
-      formData.append("images", item.foto);
-    });
-
+  // Perbaikan fetchStats dengan error handling yang lebih detail
+  const fetchStats = async () => {
     try {
-      await axios.post("http://localhost:8000/api/save", formData, {
-        headers: { "Content-Type": "multipart/form-data" },
+      setLoading(true);
+      
+      // Check if token exists
+      const token = localStorage.getItem('token');
+      console.log('Token exists:', !!token);
+      
+      if (!token) {
+        error("Token tidak ditemukan. Silakan login kembali.");
+        logout();
+        return;
+      }
+      
+      // Make request with proper headers and timeout
+      const response = await axios.get("http://localhost:8000/api/dashboard/stats", {
+        headers: {
+          'Authorization': `Bearer ${token}`,
+          'Content-Type': 'application/json'
+        },
+        timeout: 10000 // 10 seconds timeout
       });
-      alert("Data berhasil disimpan!");
-      setData([]);
-    } catch (error) {
-      alert("Gagal menyimpan data: " + error.message);
+      
+      console.log('Dashboard stats response:', response.data);
+      setStats(response.data);
+      
+    } catch (err) {
+      console.error("Error fetching stats:", err);
+      
+      // Detailed error handling
+      if (err.code === 'ECONNABORTED') {
+        error("Request timeout. Server mungkin sedang lambat.");
+      } else if (err.response?.status === 401) {
+        error("Sesi login telah berakhir. Silakan login kembali.");
+        logout();
+      } else if (err.response?.status === 404) {
+        error("Endpoint dashboard tidak ditemukan");
+      } else if (err.response?.status === 500) {
+        error("Server error. Pastikan backend berjalan dengan benar.");
+        console.error("Server error details:", err.response?.data);
+      } else if (err.code === 'ECONNREFUSED' || err.message?.includes('Network Error')) {
+        error("Tidak dapat terhubung ke server. Pastikan backend berjalan di http://localhost:8000");
+      } else {
+        error(`Gagal memuat statistik: ${err.response?.data?.detail || err.message || 'Unknown error'}`);
+      }
+    } finally {
+      setLoading(false);
     }
   };
 
-  const handleGenerate = async () => {
-    if (data.length === 0) {
-      alert("Tidak ada data untuk di-generate.");
-      return;
-    }
-
-    setIsGenerating(true);
-    const formData = new FormData();
-    data.forEach((item, i) => {
-      formData.append("entries", JSON.stringify({
-        no: i + 1,
-        jalur: item.jalur,
-        kondisi: item.kondisi,
-        keterangan: item.keterangan
-      }));
-      formData.append("images", item.foto);
-    });
-
-    const timestamp = dayjs().format("YYYYMMDD-HHmmss");
-
+  // Tambahkan fungsi untuk generate Excel dari cache
+  const handleGenerateExcel = async () => {
     try {
-      const response = await axios.post("http://localhost:8000/api/generate", formData, {
-        responseType: "blob",
-        headers: { "Content-Type": "multipart/form-data" },
-      });
+      const token = localStorage.getItem('token');
+      if (!token) {
+        error("Token tidak ditemukan. Silakan login kembali.");
+        return;
+      }
 
-      const blob = new Blob([response.data], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
+      success("Mengambil data dari cache...");
+      
+      const response = await axios.post(
+        "http://localhost:8000/api/inspeksi/generate-from-cache",
+        {},
+        {
+          headers: {
+            'Authorization': `Bearer ${token}`,
+          },
+          responseType: 'blob'
+        }
+      );
+
+      // Create download link
+      const url = window.URL.createObjectURL(new Blob([response.data]));
+      const link = document.createElement('a');
       link.href = url;
-      link.setAttribute("download", `output-${timestamp}.xlsx`);
+      link.setAttribute('download', `inspeksi-cache-${new Date().toISOString().slice(0, 19).replace(/:/g, '-')}.xlsx`);
       document.body.appendChild(link);
       link.click();
       link.remove();
-    } catch (error) {
-      alert("Gagal generate: " + error.message);
-    } finally {
-      setIsGenerating(false);
+      window.URL.revokeObjectURL(url);
+
+      success("File Excel berhasil didownload!");
+      
+    } catch (err) {
+      console.error("Error generating Excel:", err);
+      if (err.response?.status === 400) {
+        error("Tidak ada data cache untuk di-generate. Silakan input data terlebih dahulu.");
+      } else {
+        error("Gagal generate Excel: " + (err.response?.data?.detail || err.message));
+      }
     }
   };
 
-  const getKondisiColor = (kondisi) => {
-    switch (kondisi) {
-      case "Baik": return "bg-green-100 text-green-800 border-green-200";
-      case "Sedang": return "bg-yellow-100 text-yellow-800 border-yellow-200";
-      case "Buruk": return "bg-red-100 text-red-800 border-red-200";
-      default: return "bg-gray-100 text-gray-800 border-gray-200";
-    }
-  };
+  useEffect(() => {
+    fetchStats();
+  }, []);
 
-  const getKondisiIcon = (kondisi) => {
-    switch (kondisi) {
-      case "Baik": return "🟢";
-      case "Sedang": return "🟡";
-      case "Buruk": return "🔴";
-      default: return "⚪";
-    }
-  };
+  // Rest of component remains the same until Quick Actions section
+  const StatCard = ({ title, value, icon, color, subtitle, trend }) => (
+    <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6 hover:shadow-md transition-shadow">
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-sm text-gray-600 mb-1">{title}</p>
+          <p className={`text-3xl font-bold ${color}`}>{value}</p>
+          {subtitle && <p className="text-xs text-gray-500 mt-1">{subtitle}</p>}
+        </div>
+        <div className={`w-14 h-14 rounded-xl flex items-center justify-center ${color.replace('text-', 'bg-').replace('-600', '-100')}`}>
+          {icon}
+        </div>
+      </div>
+      {trend && (
+        <div className="mt-4 flex items-center space-x-2">
+          <div className="flex items-center text-xs text-green-600">
+            <svg className="w-3 h-3 mr-1" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 7h8m0 0v8m0-8l-8 8-4-4-6 6" />
+            </svg>
+            {trend}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+
+  if (loading) {
+    return (
+      <AdminLayout>
+        <div className="flex items-center justify-center min-h-[400px]">
+          <div className="text-center">
+            <div className="animate-spin rounded-full h-12 w-12 border-b-2 border-blue-600 mx-auto mb-4"></div>
+            <p className="text-gray-600">Memuat statistik...</p>
+          </div>
+        </div>
+      </AdminLayout>
+    );
+  }
 
   return (
     <AdminLayout>
-      {/* Header Section */}
+      {/* Welcome Section */}
       <div className="mb-8">
-        <div className="flex items-center justify-between">
-          <div>
-            <h1 className="text-3xl font-bold text-gray-900 mb-2">Dashboard OCR</h1>
-            <p className="text-gray-600">Kelola data infrastruktur Jasa Marga</p>
-          </div>
-          <div className="flex items-center space-x-2">
-            <div className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm font-medium">
-              {data.length} Data
+        <div className="bg-gradient-to-r from-blue-600 to-blue-700 rounded-2xl p-8 text-white">
+          <div className="flex items-center justify-between">
+            <div>
+              <h1 className="text-3xl font-bold mb-2">
+                Selamat Datang, {user?.full_name}! 👋
+              </h1>
+              <p className="text-blue-100 text-lg">
+                Kelola data infrastruktur Jasa Marga dengan mudah dan efisien
+              </p>
+              <div className="mt-4 flex items-center space-x-6 text-blue-100">
+                <div className="flex items-center space-x-2">
+                  <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                    <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                  </svg>
+                  <span className="text-sm">
+                    {new Date().toLocaleDateString('id-ID', { 
+                      weekday: 'long', 
+                      year: 'numeric', 
+                      month: 'long', 
+                      day: 'numeric' 
+                    })}
+                  </span>
+                </div>
+                <div className="flex items-center space-x-2">
+                  <div className="w-2 h-2 bg-green-400 rounded-full animate-pulse"></div>
+                  <span className="text-sm">System Online</span>
+                </div>
+              </div>
+            </div>
+            <div className="hidden md:block">
+              <div className="w-32 h-32 bg-white/10 rounded-2xl flex items-center justify-center backdrop-blur-sm">
+                <svg className="w-16 h-16 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+                </svg>
+              </div>
             </div>
           </div>
         </div>
       </div>
 
-      {/* Stats Cards */}
-      <div className="grid grid-cols-1 md:grid-cols-4 gap-6 mb-8">
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm text-gray-600 mb-1">Total Data</p>
-              <p className="text-2xl font-bold text-gray-900">{data.length}</p>
+      {/* Quick Actions - PERBAIKAN: Tambah tombol Generate Excel */}
+      <div className="mb-8">
+        <h2 className="text-xl font-semibold text-gray-900 mb-4">Aksi Cepat</h2>
+        <div className="grid grid-cols-1 md:grid-cols-5 gap-4">
+          <Link
+            to="/jadwal"
+            className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 hover:shadow-md transition-all duration-200 hover:scale-105 group"
+          >
+            <div className="flex items-center space-x-4">
+              <div className="w-12 h-12 bg-blue-100 rounded-xl flex items-center justify-center group-hover:bg-blue-600 transition-colors">
+                <svg className="w-6 h-6 text-blue-600 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="font-medium text-gray-900">Buat Jadwal</h3>
+                <p className="text-sm text-gray-500">Jadwal inspeksi baru</p>
+              </div>
             </div>
-            <div className="w-12 h-12 bg-blue-100 rounded-lg flex items-center justify-center">
-              <svg className="w-6 h-6 text-blue-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-              </svg>
-            </div>
-          </div>
-        </div>
+          </Link>
 
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm text-gray-600 mb-1">Kondisi Baik</p>
-              <p className="text-2xl font-bold text-green-600">{data.filter(item => item.kondisi === 'Baik').length}</p>
+          <Link
+            to="/inspeksi"
+            className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 hover:shadow-md transition-all duration-200 hover:scale-105 group"
+          >
+            <div className="flex items-center space-x-4">
+              <div className="w-12 h-12 bg-green-100 rounded-xl flex items-center justify-center group-hover:bg-green-600 transition-colors">
+                <svg className="w-6 h-6 text-green-600 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="font-medium text-gray-900">Input Data</h3>
+                <p className="text-sm text-gray-500">Inspeksi lapangan</p>
+              </div>
             </div>
-            <div className="w-12 h-12 bg-green-100 rounded-lg flex items-center justify-center">
-              <span className="text-2xl">🟢</span>
-            </div>
-          </div>
-        </div>
+          </Link>
 
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm text-gray-600 mb-1">Kondisi Sedang</p>
-              <p className="text-2xl font-bold text-yellow-600">{data.filter(item => item.kondisi === 'Sedang').length}</p>
+          <Link
+            to="/history"
+            className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 hover:shadow-md transition-all duration-200 hover:scale-105 group"
+          >
+            <div className="flex items-center space-x-4">
+              <div className="w-12 h-12 bg-purple-100 rounded-xl flex items-center justify-center group-hover:bg-purple-600 transition-colors">
+                <svg className="w-6 h-6 text-purple-600 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="font-medium text-gray-900">Lihat History</h3>
+                <p className="text-sm text-gray-500">Data tersimpan</p>
+              </div>
             </div>
-            <div className="w-12 h-12 bg-yellow-100 rounded-lg flex items-center justify-center">
-              <span className="text-2xl">🟡</span>
-            </div>
-          </div>
-        </div>
+          </Link>
 
-        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
-          <div className="flex items-center justify-between">
-            <div>
-              <p className="text-sm text-gray-600 mb-1">Kondisi Buruk</p>
-              <p className="text-2xl font-bold text-red-600">{data.filter(item => item.kondisi === 'Buruk').length}</p>
+          {/* PERBAIKAN: Tombol Generate Excel yang mengambil dari cache */}
+          <button 
+            onClick={handleGenerateExcel}
+            className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 hover:shadow-md transition-all duration-200 hover:scale-105 group"
+          >
+            <div className="flex items-center space-x-4">
+              <div className="w-12 h-12 bg-yellow-100 rounded-xl flex items-center justify-center group-hover:bg-yellow-600 transition-colors">
+                <svg className="w-6 h-6 text-yellow-600 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="font-medium text-gray-900">Generate Excel</h3>
+                <p className="text-sm text-gray-500">Download dari cache</p>
+              </div>
             </div>
-            <div className="w-12 h-12 bg-red-100 rounded-lg flex items-center justify-center">
-              <span className="text-2xl">🔴</span>
+          </button>
+
+          <button 
+            onClick={fetchStats}
+            className="bg-white p-6 rounded-xl shadow-sm border border-gray-200 hover:shadow-md transition-all duration-200 hover:scale-105 group"
+          >
+            <div className="flex items-center space-x-4">
+              <div className="w-12 h-12 bg-orange-100 rounded-xl flex items-center justify-center group-hover:bg-orange-600 transition-colors">
+                <svg className="w-6 h-6 text-orange-600 group-hover:text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+                </svg>
+              </div>
+              <div>
+                <h3 className="font-medium text-gray-900">Refresh Data</h3>
+                <p className="text-sm text-gray-500">Update statistik</p>
+              </div>
             </div>
-          </div>
+          </button>
         </div>
       </div>
 
-      {/* Action Buttons */}
-      <div className="flex flex-wrap gap-4 mb-6">
-        <button
-          onClick={() => setShowModal(true)}
-          className="flex items-center space-x-2 bg-gradient-to-r from-green-600 to-green-700 text-white px-6 py-3 rounded-xl hover:from-green-700 hover:to-green-800 transition-all duration-200 shadow-lg hover:shadow-xl"
-        >
-          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-          </svg>
-          <span>Tambah Data</span>
-        </button>
-
-        <button
-          onClick={handleSaveData}
-          disabled={data.length === 0}
-          className="flex items-center space-x-2 bg-gradient-to-r from-blue-600 to-blue-700 text-white px-6 py-3 rounded-xl hover:from-blue-700 hover:to-blue-800 transition-all duration-200 shadow-lg hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7H5a2 2 0 00-2 2v9a2 2 0 002 2h14a2 2 0 002-2V9a2 2 0 00-2-2h-3m-1 4l-3 3m0 0l-3-3m3 3V4" />
-          </svg>
-          <span>Simpan Data</span>
-        </button>
-
-        <button
-          onClick={handleGenerate}
-          disabled={data.length === 0 || isGenerating}
-          className="flex items-center space-x-2 bg-gradient-to-r from-purple-600 to-purple-700 text-white px-6 py-3 rounded-xl hover:from-purple-700 hover:to-purple-800 transition-all duration-200 shadow-lg hover:shadow-xl disabled:opacity-50 disabled:cursor-not-allowed"
-        >
-          {isGenerating ? (
-            <>
-              <svg className="animate-spin w-5 h-5" fill="none" viewBox="0 0 24 24">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
+      {/* Rest of the component remains the same... */}
+      {/* Statistics Overview */}
+      <div className="mb-8">
+        <h2 className="text-xl font-semibold text-gray-900 mb-4">Statistik Overview</h2>
+        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
+          <StatCard
+            title="Total Jadwal"
+            value={stats.jadwal.total}
+            subtitle={`${stats.jadwal.today} jadwal hari ini`}
+            icon={
+              <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 7V3m8 4V3m-9 8h10M5 21h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v12a2 2 0 002 2z" />
               </svg>
-              <span>Generating...</span>
-            </>
-          ) : (
-            <>
-              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 10v6m0 0l-3-3m3 3l3-3m2 8H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-              </svg>
-              <span>Generate Excel</span>
-            </>
-          )}
-        </button>
-      </div>
+            }
+            color="text-blue-600"
+            trend="+12% dari minggu lalu"
+          />
 
-      {/* Data Table */}
-      <div className="bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
-        <div className="px-6 py-4 bg-gray-50 border-b border-gray-200">
-          <h3 className="text-lg font-semibold text-gray-900">Data Infrastruktur</h3>
+          <StatCard
+            title="Inspeksi Aktif"
+            value={stats.inspeksi.draft}
+            subtitle={`${stats.inspeksi.total} total inspeksi`}
+            icon={
+              <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5H7a2 2 0 00-2 2v10a2 2 0 002 2h8a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2m-6 9l2 2 4-4" />
+              </svg>
+            }
+            color="text-green-600"
+            trend="+8% dari bulan lalu"
+          />
+
+          <StatCard
+            title="Data Tersimpan"
+            value={stats.history.total}
+            subtitle={`${stats.history.this_week} minggu ini`}
+            icon={
+              <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 7v10c0 2.21 3.582 4 8 4s8-1.79 8-4V7M4 7c0 2.21 3.582 4 8 4s8-1.79 8-4M4 7c0-2.21 3.582-4 8-4s8 1.79 8 4" />
+              </svg>
+            }
+            color="text-purple-600"
+            trend="+23% dari bulan lalu"
+          />
+
+          <StatCard
+            title="Completion Rate"
+            value={`${Math.round((stats.jadwal.completed / (stats.jadwal.total || 1)) * 100)}%`}
+            subtitle={`${stats.jadwal.completed} selesai`}
+            icon={
+              <svg className="w-7 h-7" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 19v-6a2 2 0 00-2-2H5a2 2 0 00-2 2v6a2 2 0 002 2h2a2 2 0 002-2zm0 0V9a2 2 0 012-2h2a2 2 0 012 2v10m-6 0a2 2 0 002 2h2a2 2 0 002-2m0 0V5a2 2 0 012-2h2a2 2 0 012 2v14a2 2 0 01-2 2h-2a2 2 0 01-2-2z" />
+              </svg>
+            }
+            color="text-orange-600"
+            trend="+5% dari minggu lalu"
+          />
         </div>
-        
-        {data.length === 0 ? (
-          <div className="p-12 text-center">
-            <div className="w-16 h-16 bg-gray-100 rounded-full flex items-center justify-center mx-auto mb-4">
-              <svg className="w-8 h-8 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
-              </svg>
-            </div>
-            <h3 className="text-lg font-medium text-gray-900 mb-2">Belum ada data</h3>
-            <p className="text-gray-500 mb-4">Mulai dengan menambahkan data infrastruktur pertama Anda.</p>
-            <button
-              onClick={() => setShowModal(true)}
-              className="inline-flex items-center space-x-2 bg-blue-600 text-white px-4 py-2 rounded-lg hover:bg-blue-700 transition-colors"
-            >
-              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6v6m0 0v6m0-6h6m-6 0H6" />
-              </svg>
-              <span>Tambah Data Pertama</span>
-            </button>
-          </div>
-        ) : (
-          <div className="overflow-x-auto">
-            <table className="w-full">
-              <thead className="bg-gray-50 border-b border-gray-200">
-                <tr>
-                  <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">No</th>
-                  <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Jalur</th>
-                  <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Kondisi</th>
-                  <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Keterangan</th>
-                  <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Foto</th>
-                  <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Aksi</th>
-                </tr>
-              </thead>
-              <tbody className="bg-white divide-y divide-gray-200">
-                {data.map((item, i) => (
-                  <tr key={i} className="hover:bg-gray-50 transition-colors">
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-900 font-medium">{i + 1}</td>
-                    <td className="px-6 py-4 text-sm text-gray-900 max-w-xs">
-                      <div className="truncate">{item.jalur}</div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap">
-                      <span className={`inline-flex items-center px-3 py-1 rounded-full text-xs font-medium border ${getKondisiColor(item.kondisi)}`}>
-                        <span className="mr-1">{getKondisiIcon(item.kondisi)}</span>
-                        {item.kondisi}
-                      </span>
-                    </td>
-                    <td className="px-6 py-4 text-sm text-gray-900 max-w-xs">
-                      <div className="truncate">{item.keterangan || "-"}</div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm text-gray-500">
-                      <div className="flex items-center space-x-2">
-                        <svg className="w-4 h-4 text-gray-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
-                        </svg>
-                        <span className="truncate max-w-20">{item.foto?.name || "-"}</span>
-                      </div>
-                    </td>
-                    <td className="px-6 py-4 whitespace-nowrap text-sm font-medium">
-                      <div className="flex items-center space-x-3">
-                        <button
-                          onClick={() => handleEdit(i)}
-                          className="text-blue-600 hover:text-blue-800 transition-colors"
-                          title="Edit"
-                        >
-                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M11 5H6a2 2 0 00-2 2v11a2 2 0 002 2h11a2 2 0 002-2v-5m-1.414-9.414a2 2 0 112.828 2.828L11.828 15H9v-2.828l8.586-8.586z" />
-                          </svg>
-                        </button>
-                        <button
-                          onClick={() => handleDeleteClick(i)}
-                          className="text-red-600 hover:text-red-800 transition-colors"
-                          title="Hapus"
-                        >
-                          <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 7l-.867 12.142A2 2 0 0116.138 21H7.862a2 2 0 01-1.995-1.858L5 7m5 4v6m4-6v6m1-10V4a1 1 0 00-1-1h-4a1 1 0 00-1 1v3M4 7h16" />
-                          </svg>
-                        </button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
-        )}
       </div>
 
-      {/* Modals */}
-      {showModal && (
-        <AddEditModal
-          initialData={editIndex !== null ? data[editIndex] : null}
-          onSave={handleSave}
-          onClose={() => {
-            setShowModal(false);
-            setEditIndex(null);
-          }}
-        />
-      )}
+      {/* Recent Activities */}
+      <div className="grid grid-cols-1 lg:grid-cols-2 gap-8">
+        {/* Recent Jadwal */}
+        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold text-gray-900">Jadwal Terbaru</h3>
+            <Link to="/jadwal" className="text-blue-600 hover:text-blue-800 text-sm font-medium">
+              Lihat Semua →
+            </Link>
+          </div>
+          <div className="space-y-3">
+            {stats.recent_activities.jadwal.length > 0 ? (
+              stats.recent_activities.jadwal.map((item, index) => (
+                <div key={index} className="flex items-center space-x-3 p-3 bg-gray-50 rounded-lg">
+                  <div className="w-2 h-2 bg-blue-500 rounded-full"></div>
+                  <div className="flex-1">
+                    <p className="text-sm font-medium text-gray-900">{item.nama_inspektur}</p>
+                    <p className="text-xs text-gray-500">
+                      {new Date(item.tanggal).toLocaleDateString('id-ID')} • {item.status}
+                    </p>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <p className="text-gray-500 text-sm text-center py-4">Belum ada jadwal terbaru</p>
+            )}
+          </div>
+        </div>
 
-      {showConfirmModal && (
-        <ConfirmModal
-          title="Konfirmasi Hapus"
-          message="Apakah Anda yakin ingin menghapus data ini? Tindakan ini tidak dapat dibatalkan."
-          onConfirm={handleDelete}
-          onCancel={() => {
-            setShowConfirmModal(false);
-            setDeleteIndex(null);
-          }}
-        />
-      )}
+        {/* Recent Inspeksi */}
+        <div className="bg-white rounded-xl shadow-sm border border-gray-200 p-6">
+          <div className="flex items-center justify-between mb-4">
+            <h3 className="text-lg font-semibold text-gray-900">Inspeksi Terbaru</h3>
+            <Link to="/inspeksi" className="text-green-600 hover:text-green-800 text-sm font-medium">
+              Lihat Semua →
+            </Link>
+          </div>
+          <div className="space-y-3">
+            {stats.recent_activities.inspeksi.length > 0 ? (
+              stats.recent_activities.inspeksi.map((item, index) => (
+                <div key={index} className="flex items-center space-x-3 p-3 bg-gray-50 rounded-lg">
+                  <div className="w-2 h-2 bg-green-500 rounded-full"></div>
+                  <div className="flex-1">
+                    <p className="text-sm font-medium text-gray-900">
+                      Inspeksi {item.status} • {item.data?.length || 0} data
+                    </p>
+                    <p className="text-xs text-gray-500">
+                      {new Date(item.created_at).toLocaleDateString('id-ID')}
+                    </p>
+                  </div>
+                </div>
+              ))
+            ) : (
+              <p className="text-gray-500 text-sm text-center py-4">Belum ada inspeksi terbaru</p>
+            )}
+          </div>
+        </div>
+      </div>
     </AdminLayout>
   );
 };

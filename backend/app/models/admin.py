@@ -33,3 +33,22 @@ class AdminInDB(BaseModel):
             ObjectId: str,
             datetime: lambda v: v.isoformat()
         }
+
+class AdminLogin(BaseModel):
+    username: str
+    password: str
+
+class AdminRegister(BaseModel):
+    username: str
+    email: str
+    password: str
+    full_name: str
+
+class AdminResponse(BaseModel):
+    id: str
+    username: str
+    email: str
+    full_name: str
+    is_active: bool
+    created_at: datetime
+    last_login: Optional[datetime] = None

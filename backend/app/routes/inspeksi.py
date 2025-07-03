@@ -1,691 +1,960 @@
-from fastapi import APIRouter, HTTPException, Depends, Query, UploadFile, File
-from typing import Optional, List
-from datetime import datetime
-from bson import ObjectId
+# app/routes/inspeksi.py
+from fastapi import APIRouter, UploadFile, File, Form, HTTPException, Depends
+from typing import List
+from pathlib import Path
+import shutil, uuid
 import json
+import logging
+from datetime import datetime
 
-from ..auth.auth import get_current_admin
-from ..models.inspeksi import (
-    InspeksiCreate, InspeksiUpdate, InspeksiResponse, InspeksiInDB,
-    InspeksiDataItem, OCRResult, GenerateRequest
-)
-from ..models.history import HistoryCreate, HistoryInDB
-from ..database import get_database
-from ..services.ocr_service import OCRService
-from ..services.excel_service import ExcelService
-from ..services.cache_service import CacheService
-from ..utils.helpers import create_response, save_uploaded_file, save_base64_image
-from ..utils.validators import (
-    validate_kondisi, validate_latitude_indonesia, validate_longitude_indonesia,
-    validate_jalur_name, validate_keterangan, validate_base64_image
-)
+# Import services yang sudah diperbaiki
+from app.services.ocr_service import extract_coordinates_from_image
+from app.services.excel_service import generate_excel
+from app.ocr_config import CoordinateOCRConfig, enhance_image_for_coordinates, is_coordinate_in_indonesia
+from app.config import db
+from app.constants import UPLOAD_DIR, IMAGE_TEMP_DIR, IMAGE_SAVED_DIR
+from app.routes.auth import get_current_admin
+from fastapi.responses import FileResponse
 
-router = APIRouter(prefix="/inspeksi", tags=["Inspeksi"])
+# Setup logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-# Initialize services with lazy loading
-ocr_service = None
-excel_service = None
-cache_service = None
+router = APIRouter()
 
-def get_ocr_service():
-    """Get OCR service instance with lazy loading"""
-    global ocr_service
-    if ocr_service is None:
-        ocr_service = OCRService()
-    return ocr_service
+# Collections
+temp_collection = db["temp_entries"]
+history_collection = db["saved_tables"]
 
-def get_excel_service():
-    """Get Excel service instance with lazy loading"""
-    global excel_service
-    if excel_service is None:
-        excel_service = ExcelService()
-    return excel_service
+# Inisialisasi OCR config
+ocr_config = CoordinateOCRConfig()
 
-def get_cache_service():
-    """Get Cache service instance with lazy loading"""
-    global cache_service
-    if cache_service is None:
-        cache_service = CacheService()
-    return cache_service
-
-@router.post("/", response_model=dict)
-async def create_inspeksi(
-    inspeksi_data: InspeksiCreate,
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Create inspeksi baru"""
+def extract_coordinates_with_validation(image_path: str) -> tuple[str, str]:
+    """
+    Ekstrak koordinat dengan multiple validation dan enhancement
+    """
     try:
-        db = get_database()
-        admin_id = str(current_admin["_id"])
+        logger.info(f"Extracting coordinates from: {image_path}")
         
-        # Validasi jadwal_id jika ada
-        if inspeksi_data.jadwal_id:
-            if not ObjectId.is_valid(inspeksi_data.jadwal_id):
-                raise HTTPException(status_code=400, detail="Invalid jadwal ID")
+        # Step 1: Enhance gambar untuk OCR yang lebih baik
+        enhanced_path = enhance_image_for_coordinates(image_path)
+        
+        # Step 2: Multiple OCR attempts dengan berbagai metode
+        coordinates_attempts = []
+        
+        # Attempt 1: OCR dengan image asli
+        try:
+            lat1, lon1 = extract_coordinates_from_image(image_path)
+            if lat1 and lon1:
+                coordinates_attempts.append((lat1, lon1, "original"))
+                logger.debug(f"Original OCR result: {lat1}, {lon1}")
+        except Exception as e:
+            logger.debug(f"Original OCR failed: {e}")
+        
+        # Attempt 2: OCR dengan enhanced image
+        if enhanced_path != image_path:
+            try:
+                lat2, lon2 = extract_coordinates_from_image(enhanced_path)
+                if lat2 and lon2:
+                    coordinates_attempts.append((lat2, lon2, "enhanced"))
+                    logger.debug(f"Enhanced OCR result: {lat2}, {lon2}")
+            except Exception as e:
+                logger.debug(f"Enhanced OCR failed: {e}")
+        
+        # Attempt 3: OCR dengan konfigurasi yang dioptimalkan
+        try:
+            optimized_result = ocr_config.read_coordinates_optimized(image_path)
+            if optimized_result:
+                text_optimized = " ".join(optimized_result)
+                lat3, lon3 = parse_coordinates_from_text(text_optimized)
+                if lat3 and lon3:
+                    coordinates_attempts.append((lat3, lon3, "optimized"))
+                    logger.debug(f"Optimized OCR result: {lat3}, {lon3}")
+        except Exception as e:
+            logger.debug(f"Optimized OCR failed: {e}")
+        
+        # Step 3: Pilih hasil terbaik berdasarkan prioritas dan validasi
+        if coordinates_attempts:
+            # Prioritas: enhanced > optimized > original
+            priority_order = ["enhanced", "optimized", "original"]
             
-            jadwal = await db.jadwal.find_one({
-                "_id": ObjectId(inspeksi_data.jadwal_id),
-                "admin_id": admin_id
-            })
+            # Cari koordinat yang valid untuk wilayah Indonesia
+            for method in priority_order:
+                for lat, lon, source in coordinates_attempts:
+                    if source == method:
+                        if is_coordinate_in_indonesia(lat, lon):
+                            logger.info(f"Selected valid coordinates from {source}: {lat}, {lon}")
+                            return lat, lon
+                        else:
+                            logger.warning(f"Coordinates from {source} outside Indonesia: {lat}, {lon}")
             
-            if not jadwal:
-                raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
+            # Jika tidak ada yang valid untuk Indonesia, ambil yang pertama
+            lat, lon, source = coordinates_attempts[0]
+            logger.info(f"Selected coordinates (fallback) from {source}: {lat}, {lon}")
+            return lat, lon
         
-        # Validasi data items
-        for i, item in enumerate(inspeksi_data.data):
-            if item.kondisi:
-                kondisi_valid, kondisi_msg = validate_kondisi(item.kondisi)
-                if not kondisi_valid:
-                    raise HTTPException(status_code=400, detail=f"Item {i+1}: {kondisi_msg}")
-            
-            if item.jalur:
-                jalur_valid, jalur_msg = validate_jalur_name(item.jalur)
-                if not jalur_valid:
-                    raise HTTPException(status_code=400, detail=f"Item {i+1}: {jalur_msg}")
-            
-            if item.keterangan:
-                keterangan_valid, keterangan_msg = validate_keterangan(item.keterangan)
-                if not keterangan_valid:
-                    raise HTTPException(status_code=400, detail=f"Item {i+1}: {keterangan_msg}")
+        logger.warning(f"No coordinates found in image: {image_path}")
+        return "", ""
         
-        # Create inspeksi document
-        inspeksi_doc = InspeksiInDB(
-            jadwal_id=inspeksi_data.jadwal_id,
-            data=[item.model_dump() for item in inspeksi_data.data],
-            status=inspeksi_data.status,
-            admin_id=admin_id
-        )
-        
-        # Insert to database
-        result = await db.inspeksi.insert_one(inspeksi_doc.model_dump())
-        inspeksi_id = str(result.inserted_id)
-        
-        # Save to cache if status is draft
-        if inspeksi_data.status == "draft":
-            cache_svc = get_cache_service()
-            await cache_svc.set_cache(
-                key=inspeksi_id,
-                data=inspeksi_doc.model_dump(),
-                admin_id=admin_id
-            )
-        
-        # Get created inspeksi
-        created_inspeksi = await db.inspeksi.find_one({"_id": result.inserted_id})
-        
-        # Convert untuk response
-        inspeksi_response = InspeksiResponse(
-            _id=str(created_inspeksi["_id"]),
-            jadwal_id=created_inspeksi.get("jadwal_id"),
-            data=[InspeksiDataItem(**item) for item in created_inspeksi["data"]],
-            status=created_inspeksi["status"],
-            admin_id=created_inspeksi["admin_id"],
-            created_at=created_inspeksi["created_at"]
-        )
-        
-        return create_response(
-            success=True,
-            message="Inspeksi berhasil dibuat",
-            data=inspeksi_response.model_dump()
-        )
-        
-    except HTTPException:
-        raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal membuat inspeksi: {str(e)}"
-        )
+        logger.error(f"Error in extract_coordinates_with_validation: {e}")
+        return "", ""
 
-@router.get("/", response_model=dict)
-async def get_inspeksi_list(
-    page: int = Query(1, ge=1),
-    limit: int = Query(10, ge=1, le=100),
-    status: Optional[str] = Query(None),
-    jadwal_id: Optional[str] = Query(None),
+def parse_coordinates_from_text(text: str) -> tuple[str, str]:
+    """
+    Parse koordinat dari teks dengan regex yang lebih robust
+    """
+    import re
+    
+    # Pattern untuk berbagai format koordinat
+    patterns = [
+        # Format standar: 6°52'35.622"S 107°34'37.722"E
+        r'(\d{1,3})[°*]\s*(\d{1,2})[\'′]\s*(\d{1,2}(?:\.\d+)?)[\"″]\s*([NS])\s+(\d{1,3})[°*]\s*(\d{1,2})[\'′]\s*(\d{1,2}(?:\.\d+)?)[\"″]\s*([EW])',
+        
+        # Format dengan koma: 6°52'35,622"S 107°34'37,722"E
+        r'(\d{1,3})[°*]\s*(\d{1,2})[\'′]\s*(\d{1,2}(?:,\d+)?)[\"″]\s*([NS])\s+(\d{1,3})[°*]\s*(\d{1,2})[\'′]\s*(\d{1,2}(?:,\d+)?)[\"″]\s*([EW])',
+        
+        # Format tanpa spasi: 6°52'35.622"S107°34'37.722"E
+        r'(\d{1,3})[°*](\d{1,2})[\'′](\d{1,2}(?:\.\d+)?)[\"″]([NS])(\d{1,3})[°*](\d{1,2})[\'′](\d{1,2}(?:\.\d+)?)[\"″]([EW])',
+        
+        # Format dengan karakter berbeda: 6*52'35.622"S 107*34'37.722"E
+        r'(\d{1,3})[°*o]\s*(\d{1,2})[\'′/]\s*(\d{1,2}(?:[.,]\d+)?)[\"″]\s*([NS])\s+(\d{1,3})[°*o]\s*(\d{1,2})[\'′/]\s*(\d{1,2}(?:[.,]\d+)?)[\"″]\s*([EW])',
+    ]
+    
+    # Normalisasi teks
+    cleaned_text = (text
+                   .replace(',', '.')
+                   .replace('*', '°')
+                   .replace('o', '°')
+                   .replace('O', '°')
+                   .replace('′', "'")
+                   .replace('″', '"')
+                   .replace('/', "'")
+                   .replace('\\', "'"))
+    
+    logger.debug(f"Parsing coordinates from cleaned text: {cleaned_text}")
+    
+    for i, pattern in enumerate(patterns):
+        matches = re.findall(pattern, cleaned_text, re.IGNORECASE)
+        if matches:
+            match = matches[0]
+            if len(match) == 8:
+                lat_deg, lat_min, lat_sec, lat_dir = match[0], match[1], match[2], match[3]
+                lon_deg, lon_min, lon_sec, lon_dir = match[4], match[5], match[6], match[7]
+                
+                latitude = f"{lat_deg}° {lat_min}' {lat_sec}\" {lat_dir.upper()}"
+                longitude = f"{lon_deg}° {lon_min}' {lon_sec}\" {lon_dir.upper()}"
+                
+                logger.debug(f"Pattern {i+1} matched: {latitude}, {longitude}")
+                return latitude, longitude
+    
+    logger.debug("No coordinate patterns matched")
+    return "", ""
+
+# 🟢 Upload dan Tambah Data Baru
+@router.post("/inspeksi/add")
+async def add_entry(
+    jalur: str = Form(...),
+    kondisi: str = Form(...),
+    keterangan: str = Form(...),
+    foto: UploadFile = File(...),
     current_admin: dict = Depends(get_current_admin)
 ):
-    """Get list inspeksi dengan pagination dan filter"""
+    """
+    Tambah entry baru dengan OCR koordinat yang diperbaiki (Cache data)
+    """
     try:
-        db = get_database()
         admin_id = str(current_admin["_id"])
         
-        # Build query
-        query = {"admin_id": admin_id}
+        # Validasi format file
+        ext = Path(foto.filename).suffix.lower()
+        if ext not in [".jpg", ".jpeg", ".png", ".bmp", ".tiff"]:
+            raise HTTPException(status_code=400, detail="Format gambar tidak didukung")
+
+        # Simpan file gambar ke temp
+        filename = f"{uuid.uuid4().hex}{ext}"
+        saved_path = IMAGE_TEMP_DIR / filename
         
-        if status:
-            allowed_statuses = ["draft", "generated", "saved"]
-            if status not in allowed_statuses:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Status harus salah satu dari: {', '.join(allowed_statuses)}"
-                )
-            query["status"] = status
+        # Pastikan direktori exists
+        IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+        with saved_path.open("wb") as buffer:
+            shutil.copyfileobj(foto.file, buffer)
+
+        # Ekstrak koordinat dengan validasi
+        logger.info(f"Processing image: {foto.filename}")
+        lintang, bujur = extract_coordinates_with_validation(str(saved_path))
         
-        if jadwal_id:
-            if not ObjectId.is_valid(jadwal_id):
-                raise HTTPException(status_code=400, detail="Invalid jadwal ID")
-            query["jadwal_id"] = jadwal_id
+        # Log hasil ekstraksi
+        if lintang and bujur:
+            logger.info(f"Successfully extracted coordinates: {lintang}, {bujur}")
+        else:
+            logger.warning(f"Failed to extract coordinates from {foto.filename}")
+
+        # Buat entry baru untuk cache
+        entry = {
+            "no": temp_collection.count_documents({"admin_id": admin_id}) + 1,
+            "jalur": jalur,
+            "kondisi": kondisi,
+            "keterangan": keterangan,
+            "latitude": lintang,
+            "longitude": bujur,
+            "foto_path": str(saved_path),
+            "foto_filename": filename,
+            "admin_id": admin_id,
+            "created_at": datetime.now().isoformat()
+        }
+
+        temp_collection.insert_one(entry)
         
-        # Get total count
-        total_count = await db.inspeksi.count_documents(query)
-        
-        # Get paginated results
-        skip = (page - 1) * limit
-        inspeksi_list = []
-        
-        async for inspeksi in db.inspeksi.find(query).sort("created_at", -1).skip(skip).limit(limit):
-            inspeksi_response = InspeksiResponse(
-                _id=str(inspeksi["_id"]),
-                jadwal_id=inspeksi.get("jadwal_id"),
-                data=[InspeksiDataItem(**item) for item in inspeksi["data"]],
-                status=inspeksi["status"],
-                admin_id=inspeksi["admin_id"],
-                created_at=inspeksi["created_at"],
-                updated_at=inspeksi.get("updated_at"),
-                generated_at=inspeksi.get("generated_at"),
-                saved_at=inspeksi.get("saved_at"),
-                excel_file_path=inspeksi.get("excel_file_path")
-            )
-            inspeksi_list.append(inspeksi_response.model_dump())
-        
-        # Calculate pagination info
-        total_pages = (total_count + limit - 1) // limit
-        
-        return create_response(
-            success=True,
-            message="List inspeksi berhasil diambil",
-            data={
-                "inspeksi": inspeksi_list,
-                "pagination": {
-                    "current_page": page,
-                    "total_pages": total_pages,
-                    "total_items": total_count,
-                    "items_per_page": limit,
-                    "has_next": page < total_pages,
-                    "has_prev": page > 1
-                }
+        return {
+            "message": "Data berhasil ditambahkan ke cache",
+            "coordinates": {
+                "latitude": lintang,
+                "longitude": bujur
+            },
+            "entry": {
+                "no": entry["no"],
+                "jalur": jalur,
+                "kondisi": kondisi,
+                "keterangan": keterangan,
+                "foto_filename": filename
             }
-        )
+        }
         
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal mengambil list inspeksi: {str(e)}"
-        )
+        logger.error(f"Error in add_entry: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
 
-@router.get("/{inspeksi_id}", response_model=dict)
-async def get_inspeksi_detail(
-    inspeksi_id: str,
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Get detail inspeksi by ID"""
+# 🔵 Ambil Semua Data Cache (Inspeksi)
+@router.get("/inspeksi/all")
+async def get_all_temp(current_admin: dict = Depends(get_current_admin)):
+    """
+    Ambil semua data cache untuk inspeksi
+    """
     try:
-        db = get_database()
         admin_id = str(current_admin["_id"])
-        
-        # Validate ObjectId
-        if not ObjectId.is_valid(inspeksi_id):
-            raise HTTPException(status_code=400, detail="Invalid inspeksi ID")
-        
-        # Get inspeksi
-        inspeksi = await db.inspeksi.find_one({
-            "_id": ObjectId(inspeksi_id),
-            "admin_id": admin_id
-        })
-        
-        if not inspeksi:
-            raise HTTPException(status_code=404, detail="Inspeksi tidak ditemukan")
-        
-        # Convert untuk response
-        inspeksi_response = InspeksiResponse(
-            _id=str(inspeksi["_id"]),
-            jadwal_id=inspeksi.get("jadwal_id"),
-            data=[InspeksiDataItem(**item) for item in inspeksi["data"]],
-            status=inspeksi["status"],
-            admin_id=inspeksi["admin_id"],
-            created_at=inspeksi["created_at"],
-            updated_at=inspeksi.get("updated_at"),
-            generated_at=inspeksi.get("generated_at"),
-            saved_at=inspeksi.get("saved_at"),
-            excel_file_path=inspeksi.get("excel_file_path")
-        )
-        
-        return create_response(
-            success=True,
-            message="Detail inspeksi berhasil diambil",
-            data=inspeksi_response.model_dump()
-        )
-        
-    except HTTPException:
-        raise
+        data = list(temp_collection.find({"admin_id": admin_id}, {"_id": 0}))
+        logger.info(f"Retrieved {len(data)} temporary entries for admin {admin_id}")
+        return data
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal mengambil detail inspeksi: {str(e)}"
-        )
+        logger.error(f"Error retrieving temporary data: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve data")
 
-@router.post("/{inspeksi_id}/generate", response_model=dict)
-async def generate_coordinates(
-    inspeksi_id: str,
-    generate_data: GenerateRequest,
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Generate koordinat dari gambar menggunakan OCR"""
+# 🔴 Hapus Data Cache Berdasarkan No
+@router.delete("/inspeksi/delete/{no}")
+async def delete_entry(no: int, current_admin: dict = Depends(get_current_admin)):
+    """
+    Hapus entry cache berdasarkan nomor
+    """
     try:
-        db = get_database()
         admin_id = str(current_admin["_id"])
         
-        # Validate ObjectId
-        if not ObjectId.is_valid(inspeksi_id):
-            raise HTTPException(status_code=400, detail="Invalid inspeksi ID")
+        # Ambil data untuk mendapatkan path gambar
+        entry = temp_collection.find_one({"no": no, "admin_id": admin_id})
+        if not entry:
+            raise HTTPException(status_code=404, detail="Data tidak ditemukan")
         
-        # Get inspeksi
-        inspeksi = await db.inspeksi.find_one({
-            "_id": ObjectId(inspeksi_id),
-            "admin_id": admin_id
-        })
+        # Hapus file gambar jika ada
+        if "foto_path" in entry:
+            try:
+                foto_path = Path(entry["foto_path"])
+                if foto_path.exists():
+                    foto_path.unlink()
+                    logger.info(f"Deleted image file: {foto_path}")
+            except Exception as e:
+                logger.warning(f"Failed to delete image file: {e}")
         
-        if not inspeksi:
-            raise HTTPException(status_code=404, detail="Inspeksi tidak ditemukan")
-        
-        # Validate image data
-        image_valid, image_msg = validate_base64_image(generate_data.image_data)
-        if not image_valid:
-            raise HTTPException(status_code=400, detail=image_msg)
-        
-        # Validate item index
-        if generate_data.item_index >= len(inspeksi["data"]):
-            raise HTTPException(status_code=400, detail="Invalid item index")
-        
-        # Process image dengan OCR
-        ocr_svc = get_ocr_service()
-        ocr_result = ocr_svc.process_image(generate_data.image_data)
-        
-        if not ocr_result["success"]:
-            return create_response(
-                success=False,
-                message="Gagal memproses gambar",
-                error=ocr_result["error_message"]
-            )
-        
-        # Validate koordinat jika berhasil diekstrak
-        latitude = ocr_result["latitude"]
-        longitude = ocr_result["longitude"]
-        
-        if latitude and longitude:
-            lat_valid, lat_msg = validate_latitude_indonesia(latitude)
-            if not lat_valid:
-                return create_response(
-                    success=False,
-                    message=f"Koordinat tidak valid: {lat_msg}",
-                    data=ocr_result
-                )
-            
-            lon_valid, lon_msg = validate_longitude_indonesia(longitude)
-            if not lon_valid:
-                return create_response(
-                    success=False,
-                    message=f"Koordinat tidak valid: {lon_msg}",
-                    data=ocr_result
-                )
-        
-        # Save image dan update data inspeksi
-        try:
-            image_path = await save_base64_image(generate_data.image_data)
-            
-            # Update data item
-            inspeksi["data"][generate_data.item_index]["latitude"] = latitude or ""
-            inspeksi["data"][generate_data.item_index]["longitude"] = longitude or ""
-            inspeksi["data"][generate_data.item_index]["image"] = generate_data.image_data
-            inspeksi["data"][generate_data.item_index]["image_filename"] = image_path
-            
-            # Update inspeksi di database
-            await db.inspeksi.update_one(
-                {"_id": ObjectId(inspeksi_id)},
-                {
-                    "$set": {
-                        "data": inspeksi["data"],
-                        "status": "generated",
-                        "generated_at": datetime.utcnow(),
-                        "updated_at": datetime.utcnow()
-                    }
-                }
-            )
-            
-            # Update cache
-            cache_svc = get_cache_service()
-            await cache_svc.set_cache(
-                key=inspeksi_id,
-                data=inspeksi,
-                admin_id=admin_id
-            )
-            
-            # Add to history
-            history_doc = HistoryInDB(
-                action_type="generate",
-                inspeksi_id=inspeksi_id,
-                jadwal_id=inspeksi.get("jadwal_id"),
-                description=f"Generate koordinat untuk item {generate_data.item_index + 1}",
-                admin_id=admin_id
-            )
-            await db.history.insert_one(history_doc.model_dump())
-            
-            return create_response(
-                success=True,
-                message="Koordinat berhasil di-generate",
-                data={
-                    "ocr_result": ocr_result,
-                    "updated_item": inspeksi["data"][generate_data.item_index]
-                }
-            )
-            
-        except Exception as e:
-            return create_response(
-                success=False,
-                message=f"Gagal menyimpan gambar: {str(e)}",
-                data=ocr_result
-            )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal generate koordinat: {str(e)}"
-        )
-
-@router.post("/{inspeksi_id}/save", response_model=dict)
-async def save_inspeksi(
-    inspeksi_id: str,
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Save inspeksi dan generate Excel file"""
-    try:
-        db = get_database()
-        admin_id = str(current_admin["_id"])
-        
-        # Validate ObjectId
-        if not ObjectId.is_valid(inspeksi_id):
-            raise HTTPException(status_code=400, detail="Invalid inspeksi ID")
-        
-        # Get inspeksi
-        inspeksi = await db.inspeksi.find_one({
-            "_id": ObjectId(inspeksi_id),
-            "admin_id": admin_id
-        })
-        
-        if not inspeksi:
-            raise HTTPException(status_code=404, detail="Inspeksi tidak ditemukan")
-        
-        if inspeksi["status"] == "saved":
-            raise HTTPException(
-                status_code=400,
-                detail="Inspeksi sudah dalam status saved"
-            )
-        
-        # Validate data sebelum save
-        if not inspeksi["data"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Tidak ada data inspeksi untuk disimpan"
-            )
-        
-        # Generate Excel file
-        try:
-            excel_svc = get_excel_service()
-            excel_path = excel_svc.generate_excel(
-                data=inspeksi["data"],
-                admin_id=admin_id
-            )
-            
-            # Update inspeksi status
-            await db.inspeksi.update_one(
-                {"_id": ObjectId(inspeksi_id)},
-                {
-                    "$set": {
-                        "status": "saved",
-                        "saved_at": datetime.utcnow(),
-                        "excel_file_path": str(excel_path),
-                        "updated_at": datetime.utcnow()
-                    }
-                }
-            )
-            
-            # Clear cache
-            cache_svc = get_cache_service()
-            await cache_svc.delete_cache(inspeksi_id, admin_id)
-            
-            # Add to history
-            history_doc = HistoryInDB(
-                action_type="save",
-                inspeksi_id=inspeksi_id,
-                jadwal_id=inspeksi.get("jadwal_id"),
-                data_snapshot=inspeksi,
-                excel_file_path=str(excel_path),
-                description="Inspeksi disimpan dan Excel di-generate",
-                admin_id=admin_id
-            )
-            await db.history.insert_one(history_doc.model_dump())
-            
-            # Update jadwal status jika ada
-            if inspeksi.get("jadwal_id"):
-                await db.jadwal.update_one(
-                    {"_id": ObjectId(inspeksi["jadwal_id"])},
-                    {
-                        "$set": {
-                            "status": "completed",
-                            "updated_at": datetime.utcnow()
-                        }
-                    }
-                )
-            
-            return create_response(
-                success=True,
-                message="Inspeksi berhasil disimpan dan Excel di-generate",
-                data={
-                    "excel_file_path": str(excel_path),
-                    "saved_at": datetime.utcnow().isoformat()
-                }
-            )
-            
-        except Exception as e:
-            raise HTTPException(
-                status_code=500,
-                detail=f"Gagal generate Excel: {str(e)}"
-            )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal menyimpan inspeksi: {str(e)}"
-        )
-
-@router.put("/{inspeksi_id}", response_model=dict)
-async def update_inspeksi(
-    inspeksi_id: str,
-    inspeksi_update: InspeksiUpdate,
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Update inspeksi data"""
-    try:
-        db = get_database()
-        admin_id = str(current_admin["_id"])
-        
-        # Validate ObjectId
-        if not ObjectId.is_valid(inspeksi_id):
-            raise HTTPException(status_code=400, detail="Invalid inspeksi ID")
-        
-        # Get existing inspeksi
-        existing_inspeksi = await db.inspeksi.find_one({
-            "_id": ObjectId(inspeksi_id),
-            "admin_id": admin_id
-        })
-        
-        if not existing_inspeksi:
-            raise HTTPException(status_code=404, detail="Inspeksi tidak ditemukan")
-        
-        if existing_inspeksi["status"] == "saved":
-            raise HTTPException(
-                status_code=400,
-                detail="Tidak dapat mengupdate inspeksi yang sudah disimpan"
-            )
-        
-        # Prepare update data
-        update_data = {}
-        
-        if inspeksi_update.jadwal_id is not None:
-            if inspeksi_update.jadwal_id:
-                if not ObjectId.is_valid(inspeksi_update.jadwal_id):
-                    raise HTTPException(status_code=400, detail="Invalid jadwal ID")
-                
-                jadwal = await db.jadwal.find_one({
-                    "_id": ObjectId(inspeksi_update.jadwal_id),
-                    "admin_id": admin_id
-                })
-                
-                if not jadwal:
-                    raise HTTPException(status_code=404, detail="Jadwal tidak ditemukan")
-            
-            update_data["jadwal_id"] = inspeksi_update.jadwal_id
-        
-        if inspeksi_update.data is not None:
-            # Validasi data items
-            for i, item in enumerate(inspeksi_update.data):
-                if item.kondisi:
-                    kondisi_valid, kondisi_msg = validate_kondisi(item.kondisi)
-                    if not kondisi_valid:
-                        raise HTTPException(status_code=400, detail=f"Item {i+1}: {kondisi_msg}")
-                
-                if item.jalur:
-                    jalur_valid, jalur_msg = validate_jalur_name(item.jalur)
-                    if not jalur_valid:
-                        raise HTTPException(status_code=400, detail=f"Item {i+1}: {jalur_msg}")
-                
-                if item.keterangan:
-                    keterangan_valid, keterangan_msg = validate_keterangan(item.keterangan)
-                    if not keterangan_valid:
-                        raise HTTPException(status_code=400, detail=f"Item {i+1}: {keterangan_msg}")
-            
-            update_data["data"] = [item.model_dump() for item in inspeksi_update.data]
-        
-        if inspeksi_update.status is not None:
-            allowed_statuses = ["draft", "generated", "saved"]
-            if inspeksi_update.status not in allowed_statuses:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Status harus salah satu dari: {', '.join(allowed_statuses)}"
-                )
-            update_data["status"] = inspeksi_update.status
-        
-        if not update_data:
-            raise HTTPException(
-                status_code=400,
-                detail="Tidak ada data yang diupdate"
-            )
-        
-        # Add updated timestamp
-        update_data["updated_at"] = datetime.utcnow()
-        
-        # Update inspeksi
-        await db.inspeksi.update_one(
-            {"_id": ObjectId(inspeksi_id)},
-            {"$set": update_data}
-        )
-        
-        # Update cache
-        updated_inspeksi = await db.inspeksi.find_one({"_id": ObjectId(inspeksi_id)})
-        cache_svc = get_cache_service()
-        await cache_svc.set_cache(
-            key=inspeksi_id,
-            data=updated_inspeksi,
-            admin_id=admin_id
-        )
-        
-        # Convert untuk response
-        inspeksi_response = InspeksiResponse(
-            _id=str(updated_inspeksi["_id"]),
-            jadwal_id=updated_inspeksi.get("jadwal_id"),
-            data=[InspeksiDataItem(**item) for item in updated_inspeksi["data"]],
-            status=updated_inspeksi["status"],
-            admin_id=updated_inspeksi["admin_id"],
-            created_at=updated_inspeksi["created_at"],
-            updated_at=updated_inspeksi.get("updated_at"),
-            generated_at=updated_inspeksi.get("generated_at"),
-            saved_at=updated_inspeksi.get("saved_at"),
-            excel_file_path=updated_inspeksi.get("excel_file_path")
-        )
-        
-        return create_response(
-            success=True,
-            message="Inspeksi berhasil diupdate",
-            data=inspeksi_response.model_dump()
-        )
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal mengupdate inspeksi: {str(e)}"
-        )
-
-@router.delete("/{inspeksi_id}", response_model=dict)
-async def delete_inspeksi(
-    inspeksi_id: str,
-    current_admin: dict = Depends(get_current_admin)
-):
-    """Delete inspeksi"""
-    try:
-        db = get_database()
-        admin_id = str(current_admin["_id"])
-        
-        # Validate ObjectId
-        if not ObjectId.is_valid(inspeksi_id):
-            raise HTTPException(status_code=400, detail="Invalid inspeksi ID")
-        
-        # Get existing inspeksi
-        existing_inspeksi = await db.inspeksi.find_one({
-            "_id": ObjectId(inspeksi_id),
-            "admin_id": admin_id
-        })
-        
-        if not existing_inspeksi:
-            raise HTTPException(status_code=404, detail="Inspeksi tidak ditemukan")
-        
-        # Delete inspeksi
-        result = await db.inspeksi.delete_one({"_id": ObjectId(inspeksi_id)})
-        
+        # Hapus dari database
+        result = temp_collection.delete_one({"no": no, "admin_id": admin_id})
         if result.deleted_count == 0:
-            raise HTTPException(status_code=404, detail="Inspeksi tidak ditemukan")
+            raise HTTPException(status_code=404, detail="Data tidak ditemukan")
         
-        # Clear cache
-        cache_svc = get_cache_service()
-        await cache_svc.delete_cache(inspeksi_id, admin_id)
+        logger.info(f"Deleted entry no: {no} for admin {admin_id}")
+        return {"message": "Data berhasil dihapus"}
         
-        # Add to history
-        history_doc = HistoryInDB(
-            action_type="delete",
-            inspeksi_id=inspeksi_id,
-            jadwal_id=existing_inspeksi.get("jadwal_id"),
-            data_snapshot=existing_inspeksi,
-            description="Inspeksi dihapus",
-            admin_id=admin_id
-        )
-        await db.history.insert_one(history_doc.model_dump())
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting entry {no}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to delete entry")
+
+# 🟡 Generate File Excel (Bisa berulang kali)
+@router.post("/inspeksi/generate")
+async def generate_file(
+    images: List[UploadFile] = File(...),
+    entries: List[str] = Form(...),
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Generate Excel file dengan OCR koordinat yang diperbaiki (Bisa berulang kali)
+    """
+    try:
+        admin_id = str(current_admin["_id"])
         
-        return create_response(
-            success=True,
-            message="Inspeksi berhasil dihapus"
+        # Parse JSON entries dari FormData
+        parsed = [json.loads(e) for e in entries]
+        if not parsed or len(parsed) != len(images):
+            raise HTTPException(400, "Jumlah entries dan images tidak cocok")
+
+        logger.info(f"Generating Excel for {len(images)} images for admin {admin_id}")
+
+        # Siapkan data lengkap untuk excel
+        full_entries = []
+        for i, (entry, img) in enumerate(zip(parsed, images), start=1):
+            try:
+                logger.info(f"Processing image {i}/{len(images)}: {img.filename}")
+                
+                # Validasi format file
+                ext = Path(img.filename).suffix.lower()
+                if ext not in ['.jpg', '.jpeg', '.png', '.bmp', '.tiff']:
+                    logger.warning(f"Unsupported file format: {ext}")
+                    continue
+                
+                # Simpan gambar sementara
+                fname = f"{uuid.uuid4().hex}{ext}"
+                save_path = IMAGE_TEMP_DIR / fname
+                
+                # Pastikan direktori exists
+                IMAGE_TEMP_DIR.mkdir(parents=True, exist_ok=True)
+                
+                with save_path.open("wb") as f:
+                    shutil.copyfileobj(img.file, f)
+
+                # OCR: ambil lintang & bujur dengan validasi
+                lintang, bujur = extract_coordinates_with_validation(str(save_path))
+                
+                # Log hasil untuk setiap gambar
+                if lintang and bujur:
+                    logger.info(f"Image {i} coordinates: {lintang}, {bujur}")
+                    
+                    # Validasi tambahan untuk wilayah Indonesia
+                    if not is_coordinate_in_indonesia(lintang, bujur):
+                        logger.warning(f"Image {i} coordinates outside Indonesia: {lintang}, {bujur}")
+                else:
+                    logger.warning(f"Failed to extract coordinates from image {i}")
+
+                # Lengkapi entry
+                entry_complete = {
+                    "no": i,
+                    "jalur": entry.get("jalur", ""),
+                    "latitude": lintang,
+                    "longitude": bujur,
+                    "kondisi": entry.get("kondisi", ""),
+                    "keterangan": entry.get("keterangan", ""),
+                    "foto_path": str(save_path),
+                    "image": str(save_path),  # Untuk compatibility dengan excel service
+                }
+                full_entries.append(entry_complete)
+                
+            except Exception as e:
+                logger.error(f"Error processing image {i}: {e}")
+                # Tetap lanjutkan dengan entry kosong untuk koordinat
+                entry_complete = {
+                    "no": i,
+                    "jalur": entry.get("jalur", ""),
+                    "latitude": "",
+                    "longitude": "",
+                    "kondisi": entry.get("kondisi", ""),
+                    "keterangan": entry.get("keterangan", ""),
+                    "foto_path": "",
+                    "image": "",
+                }
+                full_entries.append(entry_complete)
+
+        if not full_entries:
+            raise HTTPException(400, "Tidak ada data yang berhasil diproses")
+
+        # Generate Excel dan kirim file sebagai response download
+        save_dir = UPLOAD_DIR
+        save_dir.mkdir(parents=True, exist_ok=True)
+        output_path = generate_excel(full_entries, save_dir)
+
+        logger.info(f"Excel file generated successfully: {output_path}")
+        
+        return FileResponse(
+            path=str(output_path),
+            filename=f"inspeksi-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
         
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=500,
-            detail=f"Gagal menghapus inspeksi: {str(e)}"
+        logger.error(f"Error in generate_file: {e}")
+        raise HTTPException(status_code=500, detail=f"Failed to generate Excel file: {str(e)}")
+
+# 🟣 Simpan Data dan Pindahkan ke History (Sekali saja, lalu refresh)
+@router.post("/inspeksi/save")
+async def save_data(
+    entries: List[str] = Form(...),
+    images: List[UploadFile] = File(...),
+    current_admin: dict = Depends(get_current_admin)
+):
+    """
+    Simpan data dari inspeksi ke history dan hapus cache (Sekali saja, lalu refresh)
+    """
+    try:
+        admin_id = str(current_admin["_id"])
+        
+        # Parse entries dari JSON string
+        parsed_entries = []
+        for entry_str in entries:
+            try:
+                entry_data = json.loads(entry_str)
+                parsed_entries.append(entry_data)
+            except json.JSONDecodeError as e:
+                logger.error(f"Failed to parse entry: {entry_str}, error: {e}")
+                continue
+
+        if not parsed_entries:
+            raise HTTPException(status_code=400, detail="Tidak ada data valid untuk disimpan")
+
+        # Validasi jumlah images sesuai dengan entries
+        if len(images) != len(parsed_entries):
+            raise HTTPException(
+                status_code=400, 
+                detail=f"Jumlah gambar ({len(images)}) tidak sesuai dengan jumlah entries ({len(parsed_entries)})"
+            )
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder_path = IMAGE_SAVED_DIR / timestamp
+        folder_path.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"Saving {len(parsed_entries)} entries to history: {timestamp}")
+
+        # Simpan gambar dan update path
+        saved_data = []
+        successful_saves = 0
+        
+        for i, (entry, image) in enumerate(zip(parsed_entries, images)):
+            try:
+                # Validasi gambar
+                if not image.content_type.startswith('image/'):
+                    logger.warning(f"File {image.filename} bukan gambar valid")
+                    continue
+
+                # Generate nama file unik
+                file_extension = Path(image.filename).suffix if image.filename else '.jpg'
+                new_filename = f"img_{i+1:03d}_{timestamp}{file_extension}"
+                image_path = folder_path / new_filename
+
+                # Simpan gambar
+                content = await image.read()
+                with open(image_path, "wb") as f:
+                    f.write(content)
+
+                logger.info(f"Saved image {i+1}: {image_path}")
+
+                # Extract coordinates menggunakan OCR
+                latitude = ""
+                longitude = ""
+                try:
+                    latitude, longitude = extract_coordinates_with_validation(str(image_path))
+                    if latitude and longitude:
+                        logger.info(f"Extracted coordinates for image {i+1}: {latitude}, {longitude}")
+                    else:
+                        logger.warning(f"Failed to extract coordinates for image {i+1}")
+                except Exception as ocr_error:
+                    logger.error(f"OCR error for image {i+1}: {ocr_error}")
+
+                # Update entry dengan path gambar dan koordinat
+                entry_with_image = {
+                    **entry,
+                    "foto_path": str(image_path),
+                    "foto_filename": new_filename,
+                    "original_filename": image.filename,
+                    "latitude": latitude,  # Tambahkan koordinat
+                    "longitude": longitude,  # Tambahkan koordinat
+                    "saved_at": datetime.now().isoformat()
+                }
+                
+                saved_data.append(entry_with_image)
+                successful_saves += 1
+                
+            except Exception as e:
+                logger.error(f"Failed to save entry {i}: {e}")
+                # Tetap simpan entry tanpa gambar jika terjadi error
+                entry_with_error = {
+                    **entry,
+                    "foto_path": "",
+                    "foto_filename": image.filename if image else "",
+                    "original_filename": image.filename if image else "",
+                    "latitude": "",
+                    "longitude": "",
+                    "error": str(e),
+                    "saved_at": datetime.now().isoformat()
+                }
+                saved_data.append(entry_with_error)
+
+        if not saved_data:
+            raise HTTPException(status_code=400, detail="Tidak ada data yang berhasil disimpan")
+
+        # Simpan ke history collection
+        history_entry = {
+            "timestamp": timestamp,
+            "data": saved_data,
+            "admin_id": admin_id,  # Tambahkan admin_id
+            "summary": {
+                "total_entries": len(saved_data),
+                "successful_saves": successful_saves,
+                "images_saved": successful_saves,
+                "folder_path": str(folder_path),
+                "created_at": datetime.now().isoformat()
+            }
+        }
+
+        # Insert ke MongoDB
+        result = history_collection.insert_one(history_entry)
+        
+        if not result.inserted_id:
+            raise HTTPException(status_code=500, detail="Gagal menyimpan ke database")
+
+        # ✅ HAPUS CACHE setelah berhasil disimpan (Refresh halaman)
+        temp_collection.delete_many({"admin_id": admin_id})
+        logger.info(f"Cache cleared for admin {admin_id} - halaman akan refresh")
+
+        logger.info(f"Successfully saved history entry with ID: {result.inserted_id}")
+        
+        return {
+            "message": "Data berhasil disimpan ke history dan cache dibersihkan",
+            "timestamp": timestamp,
+            "total_saved": len(saved_data),
+            "successful_images": successful_saves,
+            "history_id": str(result.inserted_id),
+            "action": "refresh_page"  # Signal untuk frontend refresh
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error in save_data: {e}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+# 🟢 Simpan Data Cache ke History (Alternatif untuk data yang sudah ada di cache)
+@router.post("/inspeksi/save-cache")
+async def save_cache_to_history(current_admin: dict = Depends(get_current_admin)):
+    """
+    Simpan data dari cache ke history (Logika lama yang diperbaiki)
+    """
+    try:
+        admin_id = str(current_admin["_id"])
+        
+        # Ambil data cache untuk admin ini
+        data = list(temp_collection.find({"admin_id": admin_id}, {"_id": 0}))
+        if not data:
+            raise HTTPException(status_code=400, detail="Tidak ada data cache untuk disimpan")
+
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        folder_path = IMAGE_SAVED_DIR / timestamp
+        folder_path.mkdir(parents=True, exist_ok=True)
+
+        logger.info(f"Saving {len(data)} entries from cache to history: {timestamp}")
+
+        # Pindahkan gambar ke folder history
+        successful_moves = 0
+        for d in data:
+            try:
+                if "foto_path" in d and d["foto_path"]:
+                    original = Path(d["foto_path"])
+                    if original.exists():
+                        new_path = folder_path / original.name
+                        shutil.move(str(original), new_path)
+                        d["foto_path"] = str(new_path)
+                        successful_moves += 1
+                    else:
+                        logger.warning(f"Image file not found: {original}")
+                        d["foto_path"] = ""
+            except Exception as e:
+                logger.error(f"Failed to move image {d.get('foto_path', 'unknown')}: {e}")
+                d["foto_path"] = ""
+
+        # Simpan ke history collection
+        history_entry = {
+            "timestamp": timestamp,
+            "data": data,
+            "admin_id": admin_id,
+            "summary": {
+                "total_entries": len(data),
+                "images_moved": successful_moves,
+                "created_at": datetime.now().isoformat()
+            }
+        }
+
+        result = history_collection.insert_one(history_entry)
+        
+        if result.inserted_id:
+            # Hapus data cache setelah berhasil disimpan
+            temp_collection.delete_many({"admin_id": admin_id})
+            logger.info(f"Cache cleared for admin {admin_id} after successful save")
+            
+            return {
+                "message": "Data cache berhasil dipindahkan ke history",
+                "timestamp": timestamp,
+                "total_moved": len(data),
+                "images_moved": successful_moves,
+                "action": "refresh_page"  # Signal untuk frontend refresh
+            }
+        else:
+            raise HTTPException(status_code=500, detail="Gagal menyimpan ke database")
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error in save_cache_to_history: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# 🆕 Endpoint untuk mendapatkan statistik Inspeksi
+@router.get("/inspeksi/stats")
+async def get_inspeksi_stats(current_admin: dict = Depends(get_current_admin)):
+    """
+    Dapatkan statistik inspeksi untuk admin
+    """
+    try:
+        admin_id = str(current_admin["_id"])
+        
+        # Cache data stats
+        cache_count = temp_collection.count_documents({"admin_id": admin_id})
+        
+        # History stats untuk admin ini
+        history_count = history_collection.count_documents({"admin_id": admin_id})
+        
+        # OCR accuracy dari data cache yang ada
+        data = list(temp_collection.find({"admin_id": admin_id}, {"_id": 0}))
+        
+        total_entries = len(data)
+        entries_with_coordinates = sum(1 for d in data if d.get("latitude") and d.get("longitude"))
+        entries_with_valid_indonesia = sum(1 for d in data 
+                                         if d.get("latitude") and d.get("longitude") 
+                                         and is_coordinate_in_indonesia(d["latitude"], d["longitude"]))
+        
+        stats = {
+            "cache": {
+                "total_entries": cache_count,
+                "has_data": cache_count > 0
+            },
+            "history": {
+                "total_saved": history_count
+            },
+            "ocr_accuracy": {
+                "total_entries": total_entries,
+                "entries_with_coordinates": entries_with_coordinates,
+                "entries_with_valid_indonesia_coordinates": entries_with_valid_indonesia,
+                "coordinate_extraction_rate": (entries_with_coordinates / total_entries * 100) if total_entries > 0 else 0,
+                "valid_indonesia_rate": (entries_with_valid_indonesia / total_entries * 100) if total_entries > 0 else 0
+            }
+        }
+        
+        return stats
+        
+    except Exception as e:
+        logger.error(f"Error getting inspeksi stats: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get inspeksi statistics")
+
+# 🆕 Clear Cache (untuk reset manual)
+@router.delete("/inspeksi/clear-cache")
+async def clear_cache(current_admin: dict = Depends(get_current_admin)):
+    """
+    Hapus semua data cache untuk admin (reset manual)
+    """
+    try:
+        admin_id = str(current_admin["_id"])
+        
+        # Hapus gambar-gambar di temp
+        data = list(temp_collection.find({"admin_id": admin_id}, {"foto_path": 1}))
+        deleted_files = 0
+        for item in data:
+            if "foto_path" in item and item["foto_path"]:
+                try:
+                    foto_path = Path(item["foto_path"])
+                    if foto_path.exists():
+                        foto_path.unlink()
+                        deleted_files += 1
+                except Exception as e:
+                    logger.warning(f"Failed to delete file {item['foto_path']}: {e}")
+        
+        # Hapus data dari database
+        result = temp_collection.delete_many({"admin_id": admin_id})
+        
+        logger.info(f"Cache cleared for admin {admin_id}: {result.deleted_count} entries, {deleted_files} files")
+        
+        return {
+            "message": "Cache berhasil dibersihkan",
+            "deleted_entries": result.deleted_count,
+            "deleted_files": deleted_files
+        }
+        
+    except Exception as e:
+        logger.error(f"Error clearing cache: {e}")
+        raise HTTPException(status_code=500, detail="Failed to clear cache")
+
+# ✅ PERBAIKAN: Endpoint generate-from-cache dengan indentasi yang benar
+@router.post("/inspeksi/generate-from-cache")
+async def generate_from_cache(current_admin: dict = Depends(get_current_admin)):
+    """
+    Generate Excel file dari data cache dengan koordinat yang sudah ada
+    """
+    try:
+        admin_id = str(current_admin["_id"])
+        logger.info(f"=== GENERATE FROM CACHE START ===")
+        logger.info(f"Admin ID: {admin_id}")
+        
+        # Ambil data cache
+        logger.info("Fetching cache data...")
+        cache_data = list(temp_collection.find({"admin_id": admin_id}, {"_id": 0}))
+        logger.info(f"Cache data count: {len(cache_data)}")
+        
+        if not cache_data:
+            logger.warning("No cache data found")
+            raise HTTPException(status_code=400, detail="Tidak ada data cache untuk di-generate")
+
+        # ✅ DEBUGGING DETAIL - Log setiap item cache
+        logger.info("=== CACHE DATA DEBUGGING ===")
+        for i, item in enumerate(cache_data):
+            logger.info(f"Cache Item {i+1}:")
+            logger.info(f"  Keys: {list(item.keys())}")
+            logger.info(f"  No: {item.get('no')}")
+            logger.info(f"  Jalur: '{item.get('jalur')}'")
+            logger.info(f"  Latitude: '{item.get('latitude')}' (type: {type(item.get('latitude'))})")
+            logger.info(f"  Longitude: '{item.get('longitude')}' (type: {type(item.get('longitude'))})")
+            logger.info(f"  Kondisi: '{item.get('kondisi')}'")
+            logger.info(f"  Keterangan: '{item.get('keterangan')}'")
+            logger.info(f"  Foto path: '{item.get('foto_path')}'")
+
+        # ✅ Process data - pastikan koordinat diteruskan dengan benar
+        logger.info("=== PROCESSING DATA FOR EXCEL ===")
+        processed_data = []
+        
+        for i, item in enumerate(cache_data):
+            try:
+                # Ambil koordinat dari cache dengan validasi
+                cached_latitude = item.get("latitude", "")
+                cached_longitude = item.get("longitude", "")
+                
+                # Pastikan tidak ada leading/trailing spaces
+                if cached_latitude:
+                    cached_latitude = str(cached_latitude).strip()
+                if cached_longitude:
+                    cached_longitude = str(cached_longitude).strip()
+                
+                logger.info(f"Processing item {i+1}:")
+                logger.info(f"  Original lat: '{item.get('latitude')}'")
+                logger.info(f"  Original lon: '{item.get('longitude')}'")
+                logger.info(f"  Processed lat: '{cached_latitude}'")
+                logger.info(f"  Processed lon: '{cached_longitude}'")
+                
+                processed_item = {
+                    "no": item.get("no", i + 1),
+                    "jalur": item.get("jalur", ""),
+                    "kondisi": item.get("kondisi", ""),
+                    "keterangan": item.get("keterangan", ""),
+                    "latitude": cached_latitude,  # ✅ Koordinat dari cache
+                    "longitude": cached_longitude,  # ✅ Koordinat dari cache
+                    "foto_path": item.get("foto_path", ""),
+                    "image": item.get("foto_path", ""),
+                }
+                
+                processed_data.append(processed_item)
+                logger.info(f"  ✅ Added to processed_data with lat='{cached_latitude}', lon='{cached_longitude}'")
+                
+            except Exception as process_error:
+                logger.error(f"Error processing item {i+1}: {process_error}")
+                # Tetap tambahkan item dengan koordinat kosong jika error
+                processed_item = {
+                    "no": i + 1,
+                    "jalur": item.get("jalur", ""),
+                    "kondisi": item.get("kondisi", ""),
+                    "keterangan": item.get("keterangan", ""),
+                    "latitude": "",
+                    "longitude": "",
+                    "foto_path": "",
+                    "image": "",
+                }
+                processed_data.append(processed_item)
+
+        logger.info(f"=== FINAL PROCESSED DATA ===")
+        logger.info(f"Total processed items: {len(processed_data)}")
+        for i, item in enumerate(processed_data):
+            logger.info(f"Final item {i+1}: lat='{item['latitude']}', lon='{item['longitude']}'")
+
+        # Generate Excel
+        save_dir = UPLOAD_DIR
+        save_dir.mkdir(parents=True, exist_ok=True)
+        
+        logger.info("=== CALLING GENERATE_EXCEL ===")
+        output_path = generate_excel(processed_data, save_dir)
+        logger.info(f"Excel generation completed: {output_path}")
+
+        # Verify file exists
+        if not output_path.exists():
+            logger.error(f"Generated file does not exist: {output_path}")
+            raise HTTPException(status_code=500, detail="Generated file not found")
+
+        return FileResponse(
+            path=str(output_path),
+            filename=f"inspeksi-cache-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx",
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
+        
+    except HTTPException as he:
+        raise he
+    except Exception as e:
+        logger.error(f"=== UNEXPECTED ERROR ===")
+        logger.error(f"Error: {str(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+    
+
+# app/routes/inspeksi.py - Update generate-from-cache endpoint
+@router.post("/inspeksi/generate-from-cache")
+async def generate_from_cache(current_admin: dict = Depends(get_current_admin)):
+    """
+    Generate Excel file dari data cache dengan koordinat yang sudah ada
+    """
+    try:
+        admin_id = str(current_admin["_id"])
+        logger.info(f"=== GENERATE FROM CACHE START ===")
+        logger.info(f"Admin ID: {admin_id}")
+        
+        # Ambil data cache
+        try:
+            logger.info("Fetching cache data...")
+            cache_data = list(temp_collection.find({"admin_id": admin_id}, {"_id": 0}))
+            logger.info(f"Cache data count: {len(cache_data)}")
+        except Exception as db_error:
+            logger.error(f"Database error: {db_error}")
+            raise HTTPException(status_code=500, detail=f"Database error: {str(db_error)}")
+        
+        if not cache_data:
+            logger.warning("No cache data found")
+            raise HTTPException(status_code=400, detail="Tidak ada data cache untuk di-generate")
+
+        # ✅ DEBUGGING DETAIL - Log setiap item cache
+        logger.info("=== CACHE DATA DEBUGGING ===")
+        for i, item in enumerate(cache_data[:3]):  # Log first 3 items only
+            logger.info(f"Cache Item {i+1}:")
+            logger.info(f"  Keys: {list(item.keys())}")
+            logger.info(f"  No: {item.get('no')}")
+            logger.info(f"  Jalur: '{item.get('jalur')}'")
+            logger.info(f"  Latitude: '{item.get('latitude')}' (type: {type(item.get('latitude'))})")
+            logger.info(f"  Longitude: '{item.get('longitude')}' (type: {type(item.get('longitude'))})")
+
+        # ✅ Process data
+        try:
+            logger.info("=== PROCESSING DATA FOR EXCEL ===")
+            processed_data = []
+            
+            for i, item in enumerate(cache_data):
+                try:
+                    # Ambil koordinat dari cache dengan validasi
+                    cached_latitude = item.get("latitude", "")
+                    cached_longitude = item.get("longitude", "")
+                    
+                    # Pastikan tidak ada leading/trailing spaces
+                    if cached_latitude:
+                        cached_latitude = str(cached_latitude).strip()
+                    if cached_longitude:
+                        cached_longitude = str(cached_longitude).strip()
+                    
+                    processed_item = {
+                        "no": item.get("no", i + 1),
+                        "jalur": item.get("jalur", ""),
+                        "kondisi": item.get("kondisi", ""),
+                        "keterangan": item.get("keterangan", ""),
+                        "latitude": cached_latitude,
+                        "longitude": cached_longitude,
+                        "foto_path": item.get("foto_path", ""),
+                        "image": item.get("foto_path", ""),
+                    }
+                    
+                    processed_data.append(processed_item)
+                    
+                    if i < 3:  # Log first 3 items
+                        logger.info(f"Processed item {i+1}: lat='{cached_latitude}', lon='{cached_longitude}'")
+                    
+                except Exception as item_error:
+                    logger.error(f"Error processing item {i+1}: {item_error}")
+                    # Add item with empty coordinates if error
+                    processed_item = {
+                        "no": i + 1,
+                        "jalur": item.get("jalur", ""),
+                        "kondisi": item.get("kondisi", ""),
+                        "keterangan": item.get("keterangan", ""),
+                        "latitude": "",
+                        "longitude": "",
+                        "foto_path": "",
+                        "image": "",
+                    }
+                    processed_data.append(processed_item)
+                    
+        except Exception as process_error:
+            logger.error(f"Data processing error: {process_error}")
+            raise HTTPException(status_code=500, detail=f"Data processing error: {str(process_error)}")
+
+        logger.info(f"Total processed items: {len(processed_data)}")
+
+        # Check and create save directory
+        try:
+            save_dir = UPLOAD_DIR
+            save_dir.mkdir(parents=True, exist_ok=True)
+            logger.info(f"Save directory ready: {save_dir}")
+        except Exception as dir_error:
+            logger.error(f"Directory creation error: {dir_error}")
+            raise HTTPException(status_code=500, detail=f"Directory error: {str(dir_error)}")
+
+        # Generate Excel
+        try:
+            logger.info("=== CALLING GENERATE_EXCEL ===")
+            output_path = generate_excel(processed_data, save_dir)
+            logger.info(f"Excel generation completed: {output_path}")
+        except FileNotFoundError as fnf_error:
+            logger.error(f"Template file not found: {fnf_error}")
+            raise HTTPException(status_code=500, detail=f"Template Excel tidak ditemukan: {str(fnf_error)}")
+        except Exception as excel_error:
+            logger.error(f"Excel generation error: {excel_error}")
+            import traceback
+            logger.error(f"Excel error traceback: {traceback.format_exc()}")
+            raise HTTPException(status_code=500, detail=f"Excel generation error: {str(excel_error)}")
+
+        # Verify file exists
+        try:
+            if not output_path.exists():
+                logger.error(f"Generated file does not exist: {output_path}")
+                raise HTTPException(status_code=500, detail="Generated file not found")
+            
+            file_size = output_path.stat().st_size
+            logger.info(f"File verified, size: {file_size} bytes")
+            
+            if file_size == 0:
+                logger.error("Generated file is empty")
+                raise HTTPException(status_code=500, detail="Generated file is empty")
+                
+        except Exception as verify_error:
+            logger.error(f"File verification error: {verify_error}")
+            raise HTTPException(status_code=500, detail=f"File verification error: {str(verify_error)}")
+
+        # Return file
+        try:
+            logger.info("Returning FileResponse...")
+            return FileResponse(
+                path=str(output_path),
+                filename=f"inspeksi-cache-{datetime.now().strftime('%Y%m%d-%H%M%S')}.xlsx",
+                media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        except Exception as response_error:
+            logger.error(f"FileResponse error: {response_error}")
+            raise HTTPException(status_code=500, detail=f"File response error: {str(response_error)}")
+        
+    except HTTPException as he:
+        logger.error(f"HTTP Exception: {he.detail}")
+        raise he
+    except Exception as e:
+        logger.error(f"=== UNEXPECTED ERROR ===")
+        logger.error(f"Error: {str(e)}")
+        logger.error(f"Error type: {type(e)}")
+        import traceback
+        logger.error(f"Full traceback: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
