@@ -1,8 +1,8 @@
 # app/routes/auth.py
-from fastapi import APIRouter, HTTPException, Depends, status
+from fastapi import APIRouter, HTTPException, Depends, status, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, ValidationError
-from typing import Optional
+from typing import Optional, List
 from datetime import datetime, timedelta
 import jwt
 import bcrypt
@@ -29,6 +29,13 @@ class AdminCreate(BaseModel):
     password: str
     full_name: str
 
+class AdminUpdate(BaseModel):
+    username: Optional[str] = None
+    email: Optional[EmailStr] = None
+    full_name: Optional[str] = None
+    password: Optional[str] = None
+    is_active: Optional[bool] = None
+
 class AdminLogin(BaseModel):
     username: str
     password: str
@@ -41,6 +48,13 @@ class AdminResponse(BaseModel):
     is_active: bool
     created_at: datetime
     last_login: Optional[datetime] = None
+
+class AdminListResponse(BaseModel):
+    total: int
+    page: int
+    per_page: int
+    total_pages: int
+    data: List[AdminResponse]
 
 class Token(BaseModel):
     access_token: str
@@ -75,6 +89,13 @@ def get_admin_by_username(username: str):
 def get_admin_by_email(email: str):
     """Ambil admin berdasarkan email"""
     return admin_collection.find_one({"email": email})
+
+def get_admin_by_id(admin_id: str):
+    """Ambil admin berdasarkan ID"""
+    try:
+        return admin_collection.find_one({"_id": ObjectId(admin_id)})
+    except:
+        return None
 
 async def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(security)):
     """Dependency untuk mendapatkan admin yang sedang login"""
@@ -304,6 +325,325 @@ async def update_profile(
         raise HTTPException(
             status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
             detail=f"Failed to update profile: {str(e)}"
+        )
+
+# ===== USER MANAGEMENT ENDPOINTS =====
+
+@router.get("/users", response_model=AdminListResponse)
+async def get_users(
+    page: int = Query(1, ge=1),
+    per_page: int = Query(10, ge=1, le=100),
+    search: Optional[str] = Query(None),
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Get list of users dengan pagination dan search"""
+    try:
+        # Build filter
+        filter_query = {}
+        if search:
+            filter_query["$or"] = [
+                {"username": {"$regex": search, "$options": "i"}},
+                {"email": {"$regex": search, "$options": "i"}},
+                {"full_name": {"$regex": search, "$options": "i"}}
+            ]
+        
+        # Hitung total
+        total = admin_collection.count_documents(filter_query)
+        
+        # Hitung pagination
+        skip = (page - 1) * per_page
+        total_pages = (total + per_page - 1) // per_page
+        
+        # Ambil data
+        cursor = admin_collection.find(filter_query).skip(skip).limit(per_page).sort("created_at", -1)
+        users = []
+        
+        for user in cursor:
+            users.append(AdminResponse(
+                id=str(user["_id"]),
+                username=user["username"],
+                email=user["email"],
+                full_name=user["full_name"],
+                is_active=user["is_active"],
+                created_at=user["created_at"],
+                last_login=user.get("last_login")
+            ))
+        
+        return AdminListResponse(
+            total=total,
+            page=page,
+            per_page=per_page,
+            total_pages=total_pages,
+            data=users
+        )
+        
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get users: {str(e)}"
+        )
+
+@router.get("/users/{user_id}", response_model=AdminResponse)
+async def get_user(
+    user_id: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Get user by ID"""
+    user = get_admin_by_id(user_id)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="User not found"
+        )
+    
+    return AdminResponse(
+        id=str(user["_id"]),
+        username=user["username"],
+        email=user["email"],
+        full_name=user["full_name"],
+        is_active=user["is_active"],
+        created_at=user["created_at"],
+        last_login=user.get("last_login")
+    )
+
+@router.post("/users", response_model=AdminResponse)
+async def create_user(
+    user_data: AdminCreate,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Create new user"""
+    try:
+        # Cek apakah username sudah ada
+        if get_admin_by_username(user_data.username):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Username already exists"
+            )
+        
+        # Cek apakah email sudah ada
+        if get_admin_by_email(user_data.email):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Email already exists"
+            )
+        
+        # Hash password
+        hashed_password = hash_password(user_data.password)
+        
+        # Buat user document
+        user_doc = {
+            "username": user_data.username,
+            "email": user_data.email,
+            "password": hashed_password,
+            "full_name": user_data.full_name,
+            "is_active": True,
+            "created_at": datetime.utcnow(),
+            "last_login": None
+        }
+        
+        # Simpan ke database
+        result = admin_collection.insert_one(user_doc)
+        
+        if result.inserted_id:
+            user_doc["_id"] = result.inserted_id
+            return AdminResponse(
+                id=str(user_doc["_id"]),
+                username=user_doc["username"],
+                email=user_doc["email"],
+                full_name=user_doc["full_name"],
+                is_active=user_doc["is_active"],
+                created_at=user_doc["created_at"],
+                last_login=user_doc["last_login"]
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to create user"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create user: {str(e)}"
+        )
+
+@router.put("/users/{user_id}", response_model=AdminResponse)
+async def update_user(
+    user_id: str,
+    user_data: AdminUpdate,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Update user"""
+    try:
+        # Cek apakah user ada
+        user = get_admin_by_id(user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Prepare update data
+        update_data = {}
+        
+        if user_data.username:
+            # Cek apakah username sudah digunakan user lain
+            existing_user = get_admin_by_username(user_data.username)
+            if existing_user and str(existing_user["_id"]) != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Username already exists"
+                )
+            update_data["username"] = user_data.username
+        
+        if user_data.email:
+            # Cek apakah email sudah digunakan user lain
+            existing_user = get_admin_by_email(user_data.email)
+            if existing_user and str(existing_user["_id"]) != user_id:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="Email already exists"
+                )
+            update_data["email"] = user_data.email
+        
+        if user_data.full_name:
+            update_data["full_name"] = user_data.full_name
+        
+        if user_data.password:
+            update_data["password"] = hash_password(user_data.password)
+        
+        if user_data.is_active is not None:
+            update_data["is_active"] = user_data.is_active
+        
+        if not update_data:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No data to update"
+            )
+        
+        # Update di database
+        result = admin_collection.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": update_data}
+        )
+        
+        if result.modified_count > 0:
+            # Ambil data terbaru
+            updated_user = admin_collection.find_one({"_id": ObjectId(user_id)})
+            return AdminResponse(
+                id=str(updated_user["_id"]),
+                username=updated_user["username"],
+                email=updated_user["email"],
+                full_name=updated_user["full_name"],
+                is_active=updated_user["is_active"],
+                created_at=updated_user["created_at"],
+                last_login=updated_user.get("last_login")
+            )
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="No changes made"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update user: {str(e)}"
+        )
+
+@router.delete("/users/{user_id}")
+async def delete_user(
+    user_id: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Delete user"""
+    try:
+        # Cek apakah user ada
+        user = get_admin_by_id(user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Tidak bisa menghapus diri sendiri
+        if str(user["_id"]) == str(current_admin["_id"]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot delete yourself"
+            )
+        
+        # Hapus dari database
+        result = admin_collection.delete_one({"_id": ObjectId(user_id)})
+        
+        if result.deleted_count > 0:
+            return {"message": "User deleted successfully"}
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to delete user"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete user: {str(e)}"
+        )
+
+@router.put("/users/{user_id}/status")
+async def toggle_user_status(
+    user_id: str,
+    current_admin: dict = Depends(get_current_admin)
+):
+    """Toggle user active status"""
+    try:
+        # Cek apakah user ada
+        user = get_admin_by_id(user_id)
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+        
+        # Tidak bisa menonaktifkan diri sendiri
+        if str(user["_id"]) == str(current_admin["_id"]):
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Cannot deactivate yourself"
+            )
+        
+        # Toggle status
+        new_status = not user.get("is_active", True)
+        
+        # Update di database
+        result = admin_collection.update_one(
+            {"_id": ObjectId(user_id)},
+            {"$set": {"is_active": new_status}}
+        )
+        
+        if result.modified_count > 0:
+            return {
+                "message": f"User {'activated' if new_status else 'deactivated'} successfully",
+                "is_active": new_status
+            }
+        else:
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Failed to update user status"
+            )
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update user status: {str(e)}"
         )
 
 # Legacy endpoint untuk backward compatibility

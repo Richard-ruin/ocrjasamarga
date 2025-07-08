@@ -10,6 +10,7 @@ import EditDashboard from "./pages/EditDashboard";
 import PrivateRoute from "./utils/PrivateRoute";
 import { AuthProvider } from "./context/AuthContext";
 import { NotificationProvider } from "./context/NotificationContext";
+import UserManagement from "./pages/UserManagement";
 
 function App() {
   return (
@@ -49,6 +50,14 @@ function App() {
               element={
                 <PrivateRoute>
                   <History />
+                </PrivateRoute>
+              } 
+            />
+            <Route 
+              path="/users" 
+              element={
+                <PrivateRoute>
+                  <UserManagement />
                 </PrivateRoute>
               } 
             />
