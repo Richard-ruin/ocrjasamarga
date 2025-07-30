@@ -1,4 +1,4 @@
-# app/routes/auth.py
+# app/routes/auth.py - Updated with role-based system
 from fastapi import APIRouter, HTTPException, Depends, status, Query
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from pydantic import BaseModel, EmailStr, ValidationError
@@ -28,6 +28,7 @@ class AdminCreate(BaseModel):
     email: EmailStr
     password: str
     full_name: str
+    role: str = "petugas"  # admin atau petugas
 
 class AdminUpdate(BaseModel):
     username: Optional[str] = None
@@ -35,6 +36,7 @@ class AdminUpdate(BaseModel):
     full_name: Optional[str] = None
     password: Optional[str] = None
     is_active: Optional[bool] = None
+    role: Optional[str] = None
 
 class AdminLogin(BaseModel):
     username: str
@@ -45,6 +47,7 @@ class AdminResponse(BaseModel):
     username: str
     email: str
     full_name: str
+    role: str
     is_active: bool
     created_at: datetime
     last_login: Optional[datetime] = None
@@ -132,10 +135,26 @@ async def get_current_admin(credentials: HTTPAuthorizationCredentials = Depends(
     
     return admin
 
+async def get_admin_only(current_admin: dict = Depends(get_current_admin)):
+    """Dependency untuk memastikan hanya admin yang bisa akses"""
+    if current_admin.get("role") != "admin":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Only admin can access this resource"
+        )
+    return current_admin
+
 @router.post("/register", response_model=AdminResponse)
 async def register(admin_data: AdminCreate):
-    """Register admin baru"""
+    """Register admin/petugas baru"""
     try:
+        # Validasi role
+        if admin_data.role not in ["admin", "petugas"]:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail="Role must be either 'admin' or 'petugas'"
+            )
+        
         # Cek apakah username sudah ada
         if get_admin_by_username(admin_data.username):
             raise HTTPException(
@@ -159,6 +178,7 @@ async def register(admin_data: AdminCreate):
             "email": admin_data.email,
             "password": hashed_password,
             "full_name": admin_data.full_name,
+            "role": admin_data.role,
             "is_active": True,
             "created_at": datetime.utcnow(),
             "last_login": None
@@ -175,6 +195,7 @@ async def register(admin_data: AdminCreate):
                 username=admin_doc["username"],
                 email=admin_doc["email"],
                 full_name=admin_doc["full_name"],
+                role=admin_doc["role"],
                 is_active=admin_doc["is_active"],
                 created_at=admin_doc["created_at"],
                 last_login=admin_doc["last_login"]
@@ -198,7 +219,7 @@ async def register(admin_data: AdminCreate):
 
 @router.post("/login", response_model=Token)
 async def login(admin_data: AdminLogin):
-    """Login admin"""
+    """Login admin/petugas"""
     try:
         # Cari admin berdasarkan username
         admin = get_admin_by_username(admin_data.username)
@@ -220,7 +241,7 @@ async def login(admin_data: AdminLogin):
         if not admin.get("is_active", True):
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Admin account is disabled"
+                detail="Account is disabled"
             )
         
         # Update last_login
@@ -242,6 +263,7 @@ async def login(admin_data: AdminLogin):
             username=admin["username"],
             email=admin["email"],
             full_name=admin["full_name"],
+            role=admin.get("role", "petugas"),  # Default ke petugas untuk backward compatibility
             is_active=admin["is_active"],
             created_at=admin["created_at"],
             last_login=datetime.utcnow()
@@ -263,19 +285,18 @@ async def login(admin_data: AdminLogin):
 
 @router.post("/logout")
 async def logout(current_admin: dict = Depends(get_current_admin)):
-    """Logout admin"""
-    # Karena JWT stateless, kita hanya perlu return success
-    # Dalam implementasi production, Anda bisa menambahkan blacklist token
+    """Logout admin/petugas"""
     return {"message": "Successfully logged out"}
 
 @router.get("/me", response_model=AdminResponse)
 async def get_current_admin_info(current_admin: dict = Depends(get_current_admin)):
-    """Get current admin info"""
+    """Get current admin/petugas info"""
     return AdminResponse(
         id=str(current_admin["_id"]),
         username=current_admin["username"],
         email=current_admin["email"],
         full_name=current_admin["full_name"],
+        role=current_admin.get("role", "petugas"),
         is_active=current_admin["is_active"],
         created_at=current_admin["created_at"],
         last_login=current_admin.get("last_login")
@@ -283,19 +304,26 @@ async def get_current_admin_info(current_admin: dict = Depends(get_current_admin
 
 @router.put("/profile", response_model=AdminResponse)
 async def update_profile(
-    admin_data: AdminCreate,
+    admin_data: AdminUpdate,
     current_admin: dict = Depends(get_current_admin)
 ):
-    """Update admin profile"""
+    """Update profile (tanpa role untuk security)"""
     try:
-        update_data = {
-            "full_name": admin_data.full_name,
-            "email": admin_data.email
-        }
+        update_data = {}
         
-        # Update password jika diberikan
+        if admin_data.full_name:
+            update_data["full_name"] = admin_data.full_name
+        if admin_data.email:
+            # Cek email tidak digunakan user lain
+            existing = get_admin_by_email(admin_data.email)
+            if existing and str(existing["_id"]) != str(current_admin["_id"]):
+                raise HTTPException(400, "Email already used")
+            update_data["email"] = admin_data.email
         if admin_data.password:
             update_data["password"] = hash_password(admin_data.password)
+        
+        if not update_data:
+            raise HTTPException(400, "No data to update")
         
         # Update di database
         result = admin_collection.update_one(
@@ -311,32 +339,28 @@ async def update_profile(
                 username=updated_admin["username"],
                 email=updated_admin["email"],
                 full_name=updated_admin["full_name"],
+                role=updated_admin.get("role", "petugas"),
                 is_active=updated_admin["is_active"],
                 created_at=updated_admin["created_at"],
                 last_login=updated_admin.get("last_login")
             )
         else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No changes made"
-            )
+            raise HTTPException(400, "No changes made")
             
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update profile: {str(e)}"
-        )
+        raise HTTPException(500, f"Failed to update profile: {str(e)}")
 
-# ===== USER MANAGEMENT ENDPOINTS =====
+# ===== ADMIN-ONLY USER MANAGEMENT ENDPOINTS =====
 
 @router.get("/users", response_model=AdminListResponse)
 async def get_users(
     page: int = Query(1, ge=1),
     per_page: int = Query(10, ge=1, le=100),
     search: Optional[str] = Query(None),
-    current_admin: dict = Depends(get_current_admin)
+    role_filter: Optional[str] = Query(None),
+    current_admin: dict = Depends(get_admin_only)
 ):
-    """Get list of users dengan pagination dan search"""
+    """Get list of users - ADMIN ONLY"""
     try:
         # Build filter
         filter_query = {}
@@ -346,6 +370,8 @@ async def get_users(
                 {"email": {"$regex": search, "$options": "i"}},
                 {"full_name": {"$regex": search, "$options": "i"}}
             ]
+        if role_filter and role_filter in ["admin", "petugas"]:
+            filter_query["role"] = role_filter
         
         # Hitung total
         total = admin_collection.count_documents(filter_query)
@@ -364,6 +390,7 @@ async def get_users(
                 username=user["username"],
                 email=user["email"],
                 full_name=user["full_name"],
+                role=user.get("role", "petugas"),
                 is_active=user["is_active"],
                 created_at=user["created_at"],
                 last_login=user.get("last_login")
@@ -378,29 +405,24 @@ async def get_users(
         )
         
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to get users: {str(e)}"
-        )
+        raise HTTPException(500, f"Failed to get users: {str(e)}")
 
 @router.get("/users/{user_id}", response_model=AdminResponse)
 async def get_user(
     user_id: str,
-    current_admin: dict = Depends(get_current_admin)
+    current_admin: dict = Depends(get_admin_only)
 ):
-    """Get user by ID"""
+    """Get user by ID - ADMIN ONLY"""
     user = get_admin_by_id(user_id)
     if not user:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="User not found"
-        )
+        raise HTTPException(404, "User not found")
     
     return AdminResponse(
         id=str(user["_id"]),
         username=user["username"],
         email=user["email"],
         full_name=user["full_name"],
+        role=user.get("role", "petugas"),
         is_active=user["is_active"],
         created_at=user["created_at"],
         last_login=user.get("last_login")
@@ -409,23 +431,19 @@ async def get_user(
 @router.post("/users", response_model=AdminResponse)
 async def create_user(
     user_data: AdminCreate,
-    current_admin: dict = Depends(get_current_admin)
+    current_admin: dict = Depends(get_admin_only)
 ):
-    """Create new user"""
+    """Create new user - ADMIN ONLY"""
     try:
-        # Cek apakah username sudah ada
-        if get_admin_by_username(user_data.username):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Username already exists"
-            )
+        # Validasi role
+        if user_data.role not in ["admin", "petugas"]:
+            raise HTTPException(400, "Role must be 'admin' or 'petugas'")
         
-        # Cek apakah email sudah ada
+        # Cek username dan email
+        if get_admin_by_username(user_data.username):
+            raise HTTPException(400, "Username already exists")
         if get_admin_by_email(user_data.email):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Email already exists"
-            )
+            raise HTTPException(400, "Email already exists")
         
         # Hash password
         hashed_password = hash_password(user_data.password)
@@ -436,6 +454,7 @@ async def create_user(
             "email": user_data.email,
             "password": hashed_password,
             "full_name": user_data.full_name,
+            "role": user_data.role,
             "is_active": True,
             "created_at": datetime.utcnow(),
             "last_login": None
@@ -451,61 +470,45 @@ async def create_user(
                 username=user_doc["username"],
                 email=user_doc["email"],
                 full_name=user_doc["full_name"],
+                role=user_doc["role"],
                 is_active=user_doc["is_active"],
                 created_at=user_doc["created_at"],
                 last_login=user_doc["last_login"]
             )
         else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to create user"
-            )
+            raise HTTPException(500, "Failed to create user")
             
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to create user: {str(e)}"
-        )
+        raise HTTPException(500, f"Failed to create user: {str(e)}")
 
 @router.put("/users/{user_id}", response_model=AdminResponse)
 async def update_user(
     user_id: str,
     user_data: AdminUpdate,
-    current_admin: dict = Depends(get_current_admin)
+    current_admin: dict = Depends(get_admin_only)
 ):
-    """Update user"""
+    """Update user - ADMIN ONLY"""
     try:
         # Cek apakah user ada
         user = get_admin_by_id(user_id)
         if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
+            raise HTTPException(404, "User not found")
         
         # Prepare update data
         update_data = {}
         
         if user_data.username:
-            # Cek apakah username sudah digunakan user lain
             existing_user = get_admin_by_username(user_data.username)
             if existing_user and str(existing_user["_id"]) != user_id:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Username already exists"
-                )
+                raise HTTPException(400, "Username already exists")
             update_data["username"] = user_data.username
         
         if user_data.email:
-            # Cek apakah email sudah digunakan user lain
             existing_user = get_admin_by_email(user_data.email)
             if existing_user and str(existing_user["_id"]) != user_id:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail="Email already exists"
-                )
+                raise HTTPException(400, "Email already exists")
             update_data["email"] = user_data.email
         
         if user_data.full_name:
@@ -517,11 +520,11 @@ async def update_user(
         if user_data.is_active is not None:
             update_data["is_active"] = user_data.is_active
         
+        if user_data.role and user_data.role in ["admin", "petugas"]:
+            update_data["role"] = user_data.role
+        
         if not update_data:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No data to update"
-            )
+            raise HTTPException(400, "No data to update")
         
         # Update di database
         result = admin_collection.update_one(
@@ -537,45 +540,34 @@ async def update_user(
                 username=updated_user["username"],
                 email=updated_user["email"],
                 full_name=updated_user["full_name"],
+                role=updated_user.get("role", "petugas"),
                 is_active=updated_user["is_active"],
                 created_at=updated_user["created_at"],
                 last_login=updated_user.get("last_login")
             )
         else:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="No changes made"
-            )
+            raise HTTPException(400, "No changes made")
             
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update user: {str(e)}"
-        )
+        raise HTTPException(500, f"Failed to update user: {str(e)}")
 
 @router.delete("/users/{user_id}")
 async def delete_user(
     user_id: str,
-    current_admin: dict = Depends(get_current_admin)
+    current_admin: dict = Depends(get_admin_only)
 ):
-    """Delete user"""
+    """Delete user - ADMIN ONLY"""
     try:
         # Cek apakah user ada
         user = get_admin_by_id(user_id)
         if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
+            raise HTTPException(404, "User not found")
         
         # Tidak bisa menghapus diri sendiri
         if str(user["_id"]) == str(current_admin["_id"]):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Cannot delete yourself"
-            )
+            raise HTTPException(400, "Cannot delete yourself")
         
         # Hapus dari database
         result = admin_collection.delete_one({"_id": ObjectId(user_id)})
@@ -583,40 +575,28 @@ async def delete_user(
         if result.deleted_count > 0:
             return {"message": "User deleted successfully"}
         else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to delete user"
-            )
+            raise HTTPException(500, "Failed to delete user")
             
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to delete user: {str(e)}"
-        )
+        raise HTTPException(500, f"Failed to delete user: {str(e)}")
 
 @router.put("/users/{user_id}/status")
 async def toggle_user_status(
     user_id: str,
-    current_admin: dict = Depends(get_current_admin)
+    current_admin: dict = Depends(get_admin_only)
 ):
-    """Toggle user active status"""
+    """Toggle user active status - ADMIN ONLY"""
     try:
         # Cek apakah user ada
         user = get_admin_by_id(user_id)
         if not user:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail="User not found"
-            )
+            raise HTTPException(404, "User not found")
         
         # Tidak bisa menonaktifkan diri sendiri
         if str(user["_id"]) == str(current_admin["_id"]):
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail="Cannot deactivate yourself"
-            )
+            raise HTTPException(400, "Cannot deactivate yourself")
         
         # Toggle status
         new_status = not user.get("is_active", True)
@@ -633,27 +613,28 @@ async def toggle_user_status(
                 "is_active": new_status
             }
         else:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail="Failed to update user status"
-            )
+            raise HTTPException(500, "Failed to update user status")
             
     except HTTPException:
         raise
     except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Failed to update user status: {str(e)}"
-        )
+        raise HTTPException(500, f"Failed to update user status: {str(e)}")
 
-# Legacy endpoint untuk backward compatibility
-@router.post("/login-legacy")
-def login_legacy(request: AdminLogin):
-    """Legacy login endpoint untuk compatibility"""
-    # Ambil username dan password dari .env sebagai fallback
-    ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin@gmail.com")
-    ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin")
-    
-    if request.username == ADMIN_USERNAME and request.password == ADMIN_PASSWORD:
-        return {"message": "Login berhasil"}
-    raise HTTPException(status_code=401, detail="Username atau password salah")
+# Endpoint untuk migrasi role existing users
+@router.post("/migrate-roles")
+async def migrate_existing_users_roles(current_admin: dict = Depends(get_admin_only)):
+    """Migrate existing users to have roles - ADMIN ONLY"""
+    try:
+        # Update semua user yang belum punya role menjadi 'petugas'
+        result = admin_collection.update_many(
+            {"role": {"$exists": False}},
+            {"$set": {"role": "petugas"}}
+        )
+        
+        return {
+            "message": "Role migration completed",
+            "updated_count": result.modified_count
+        }
+        
+    except Exception as e:
+        raise HTTPException(500, f"Migration failed: {str(e)}")

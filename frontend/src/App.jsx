@@ -1,4 +1,4 @@
-// src/App.jsx
+// src/App.jsx - Updated with new routes and role-based access
 import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
 import Login from "./pages/Login";
 import Register from "./pages/Register";
@@ -7,6 +7,7 @@ import Jadwal from "./pages/Jadwal";
 import Inspeksi from "./pages/Inspeksi";
 import History from "./pages/History";
 import EditDashboard from "./pages/EditDashboard";
+import KelolaAset from "./pages/KelolaAset";
 import PrivateRoute from "./utils/PrivateRoute";
 import { AuthProvider } from "./context/AuthContext";
 import { NotificationProvider } from "./context/NotificationContext";
@@ -29,6 +30,16 @@ function App() {
                 </PrivateRoute>
               } 
             />
+            {/* Kelola Aset - Only for Petugas */}
+            <Route 
+              path="/aset" 
+              element={
+                <PrivateRoute>
+                  <KelolaAset />
+                </PrivateRoute>
+              } 
+            />
+            {/* Jadwal - Only for Petugas */}
             <Route 
               path="/jadwal" 
               element={
@@ -37,6 +48,7 @@ function App() {
                 </PrivateRoute>
               } 
             />
+            {/* Inspeksi - Only for Petugas */}
             <Route 
               path="/inspeksi" 
               element={
@@ -45,6 +57,7 @@ function App() {
                 </PrivateRoute>
               } 
             />
+            {/* History - Only for Petugas */}
             <Route 
               path="/history" 
               element={
@@ -53,6 +66,7 @@ function App() {
                 </PrivateRoute>
               } 
             />
+            {/* User Management - Only for Admin */}
             <Route 
               path="/users" 
               element={

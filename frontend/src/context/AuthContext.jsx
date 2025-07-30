@@ -1,4 +1,4 @@
-// src/context/AuthContext.jsx
+// src/context/AuthContext.jsx - Updated with role support
 import { createContext, useContext, useEffect, useState } from "react";
 import axios from "axios";
 
@@ -91,6 +91,24 @@ export const AuthProvider = ({ children }) => {
     }
   };
 
+  // Helper functions for role checking
+  const isAdmin = () => {
+    return user?.role === "admin";
+  };
+
+  const isPetugas = () => {
+    return user?.role === "petugas";
+  };
+
+  const hasRole = (role) => {
+    return user?.role === role;
+  };
+
+  const canAccess = (allowedRoles) => {
+    if (!user?.role) return false;
+    return allowedRoles.includes(user.role);
+  };
+
   const value = {
     user,
     token,
@@ -98,7 +116,13 @@ export const AuthProvider = ({ children }) => {
     login,
     register,
     logout,
-    isAuthenticated: !!token && !!user
+    isAuthenticated: !!token && !!user,
+    // Role checking functions
+    isAdmin,
+    isPetugas,
+    hasRole,
+    canAccess,
+    userRole: user?.role || null
   };
 
   return (

@@ -1,31 +1,47 @@
-// src/pages/Jadwal.jsx
+// src/pages/Jadwal.jsx - Fixed with proper error handling and UI improvements
 import { useState, useEffect } from "react";
 import AdminLayout from "../components/AdminLayout";
 import DeleteModal from "../components/DeleteModal";
 import { useNotification } from "../context/NotificationContext";
+import { useAuth } from "../context/AuthContext";
 import axios from "axios";
 
 const Jadwal = () => {
   const { success, error } = useNotification();
+  const { isPetugas } = useAuth();
   const [jadwalList, setJadwalList] = useState([]);
+  const [asetList, setAsetList] = useState([]);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [showDeleteModal, setShowDeleteModal] = useState(false);
   const [editingJadwal, setEditingJadwal] = useState(null);
   const [deleteJadwal, setDeleteJadwal] = useState(null);
+  const [isSubmitting, setIsSubmitting] = useState(false);
   const [form, setForm] = useState({
     nama_inspektur: "",
     tanggal: "",
     waktu: "",
     alamat: "",
+    id_aset: "",
     keterangan: "",
     status: "scheduled"
   });
 
+  // Get token from localStorage
+  const getAuthHeaders = () => {
+    const token = localStorage.getItem('token');
+    return {
+      'Authorization': `Bearer ${token}`,
+      'Content-Type': 'application/json'
+    };
+  };
+
   const fetchJadwal = async () => {
     try {
       setLoading(true);
-      const response = await axios.get("http://localhost:8000/api/jadwal");
+      const response = await axios.get("http://localhost:8000/api/jadwal", {
+        headers: getAuthHeaders()
+      });
       setJadwalList(response.data);
     } catch (err) {
       console.error("Error fetching jadwal:", err);
@@ -35,8 +51,23 @@ const Jadwal = () => {
     }
   };
 
+  const fetchAset = async () => {
+    try {
+      const response = await axios.get("http://localhost:8000/api/aset", {
+        headers: getAuthHeaders()
+      });
+      // Filter only active assets
+      const activeAset = response.data.filter(aset => aset.status === 'aktif');
+      setAsetList(activeAset);
+    } catch (err) {
+      console.error("Error fetching aset:", err);
+      error("Gagal memuat data aset");
+    }
+  };
+
   useEffect(() => {
     fetchJadwal();
+    fetchAset();
   }, []);
 
   const resetForm = () => {
@@ -45,6 +76,7 @@ const Jadwal = () => {
       tanggal: "",
       waktu: "",
       alamat: "",
+      id_aset: "",
       keterangan: "",
       status: "scheduled"
     });
@@ -54,12 +86,44 @@ const Jadwal = () => {
   const handleSubmit = async (e) => {
     e.preventDefault();
     
+    // Validasi form
+    if (!form.nama_inspektur.trim()) {
+      error("Nama inspektur harus diisi");
+      return;
+    }
+    
+    if (!form.tanggal) {
+      error("Tanggal harus diisi");
+      return;
+    }
+    
+    if (!form.waktu) {
+      error("Waktu harus diisi");
+      return;
+    }
+    
+    if (!form.alamat.trim()) {
+      error("Alamat harus diisi");
+      return;
+    }
+    
+    if (!form.id_aset) {
+      error("Aset harus dipilih");
+      return;
+    }
+    
+    setIsSubmitting(true);
+    
     try {
       if (editingJadwal) {
-        await axios.put(`http://localhost:8000/api/jadwal/${editingJadwal._id}`, form);
+        await axios.put(`http://localhost:8000/api/jadwal/${editingJadwal.id}`, form, {
+          headers: getAuthHeaders()
+        });
         success("Jadwal berhasil diperbarui!");
       } else {
-        await axios.post("http://localhost:8000/api/jadwal", form);
+        await axios.post("http://localhost:8000/api/jadwal", form, {
+          headers: getAuthHeaders()
+        });
         success("Jadwal berhasil ditambahkan!");
       }
       
@@ -68,7 +132,42 @@ const Jadwal = () => {
       fetchJadwal();
     } catch (err) {
       console.error("Error saving jadwal:", err);
-      error(err.response?.data?.detail || "Gagal menyimpan jadwal");
+      
+      // Handle different error types
+      let errorMessage = "Gagal menyimpan jadwal";
+      
+      if (err.response) {
+        const { status, data } = err.response;
+        
+        if (status === 422) {
+          // Validation error
+          if (data.detail && typeof data.detail === 'string') {
+            errorMessage = data.detail;
+          } else if (data.detail && Array.isArray(data.detail)) {
+            // Handle FastAPI validation errors array format
+            const errors = data.detail.map(err => 
+              `${err.loc ? err.loc.join(' → ') : 'Field'}: ${err.msg}`
+            ).join(', ');
+            errorMessage = `Validation error: ${errors}`;
+          } else {
+            errorMessage = "Data tidak valid, periksa kembali form";
+          }
+        } else if (status === 400) {
+          errorMessage = data.detail || "Data tidak valid";
+        } else if (status === 404) {
+          errorMessage = "Aset tidak ditemukan";
+        } else if (status === 500) {
+          errorMessage = "Terjadi kesalahan server";
+        } else {
+          errorMessage = data.detail || `Error ${status}`;
+        }
+      } else if (err.request) {
+        errorMessage = "Tidak dapat terhubung ke server";
+      }
+      
+      error(errorMessage);
+    } finally {
+      setIsSubmitting(false);
     }
   };
 
@@ -79,6 +178,7 @@ const Jadwal = () => {
       tanggal: jadwal.tanggal,
       waktu: jadwal.waktu,
       alamat: jadwal.alamat,
+      id_aset: jadwal.id_aset || "",
       keterangan: jadwal.keterangan || "",
       status: jadwal.status
     });
@@ -92,7 +192,9 @@ const Jadwal = () => {
 
   const handleDeleteConfirm = async () => {
     try {
-      await axios.delete(`http://localhost:8000/api/jadwal/${deleteJadwal._id}`);
+      await axios.delete(`http://localhost:8000/api/jadwal/${deleteJadwal.id}`, {
+        headers: getAuthHeaders()
+      });
       success("Jadwal berhasil dihapus!");
       setShowDeleteModal(false);
       setDeleteJadwal(null);
@@ -145,6 +247,25 @@ const Jadwal = () => {
     });
   };
 
+  // Redirect if not petugas
+  if (!isPetugas()) {
+    return (
+      <AdminLayout>
+        <div className="flex items-center justify-center min-h-[400px]">
+          <div className="text-center">
+            <div className="w-16 h-16 bg-red-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <svg className="w-8 h-8 text-red-600" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+              </svg>
+            </div>
+            <h3 className="text-lg font-medium text-gray-900 mb-2">Akses Ditolak</h3>
+            <p className="text-gray-500">Hanya petugas yang dapat mengakses halaman Jadwal.</p>
+          </div>
+        </div>
+      </AdminLayout>
+    );
+  }
+
   if (loading) {
     return (
       <AdminLayout>
@@ -165,7 +286,7 @@ const Jadwal = () => {
         <div className="flex items-center justify-between">
           <div>
             <h1 className="text-3xl font-bold text-gray-900 mb-2">Jadwal Inspeksi</h1>
-            <p className="text-gray-600">Kelola jadwal inspeksi lapangan</p>
+            <p className="text-gray-600">Kelola jadwal inspeksi lapangan dengan aset</p>
           </div>
           <div className="flex items-center space-x-3">
             <div className="px-3 py-1 bg-blue-100 text-blue-800 rounded-full text-sm font-medium">
@@ -280,6 +401,7 @@ const Jadwal = () => {
               <thead className="bg-gray-50 border-b border-gray-200">
                 <tr>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Inspektur</th>
+                  <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Aset</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Tanggal & Waktu</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Alamat</th>
                   <th className="px-6 py-4 text-left text-xs font-medium text-gray-500 uppercase tracking-wider">Status</th>
@@ -294,6 +416,19 @@ const Jadwal = () => {
                         <div className="text-sm font-medium text-gray-900">{jadwal.nama_inspektur}</div>
                         {jadwal.keterangan && (
                           <div className="text-sm text-gray-500 truncate max-w-xs">{jadwal.keterangan}</div>
+                        )}
+                      </div>
+                    </td>
+                    <td className="px-6 py-4">
+                      <div>
+                        <div className="text-sm font-medium text-gray-900">
+                          {jadwal.nama_aset || 'Aset tidak ditemukan'}
+                        </div>
+                        {jadwal.jenis_aset && (
+                          <div className="text-xs text-gray-400">{jadwal.jenis_aset}</div>
+                        )}
+                        {jadwal.lokasi_aset && (
+                          <div className="text-xs text-gray-400">{jadwal.lokasi_aset}</div>
                         )}
                       </div>
                     </td>
@@ -352,7 +487,8 @@ const Jadwal = () => {
                 </h2>
                 <button
                   onClick={() => setShowForm(false)}
-                  className="text-white/70 hover:text-white transition-colors"
+                  disabled={isSubmitting}
+                  className="text-white/70 hover:text-white transition-colors disabled:opacity-50"
                 >
                   <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
                     <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
@@ -373,8 +509,34 @@ const Jadwal = () => {
                     className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
                     value={form.nama_inspektur}
                     onChange={(e) => setForm({ ...form, nama_inspektur: e.target.value })}
+                    disabled={isSubmitting}
                     required
                   />
+                </div>
+
+                <div className="md:col-span-2">
+                  <label className="block text-sm font-medium text-gray-700 mb-2">
+                    Pilih Aset <span className="text-red-500">*</span>
+                  </label>
+                  <select
+                    className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
+                    value={form.id_aset}
+                    onChange={(e) => setForm({ ...form, id_aset: e.target.value })}
+                    disabled={isSubmitting}
+                    required
+                  >
+                    <option value="">Pilih aset untuk inspeksi</option>
+                    {asetList.map((aset) => (
+                      <option key={aset._id || aset.id} value={aset.id_aset}>
+                        {aset.nama_aset} ({aset.jenis_aset})
+                      </option>
+                    ))}
+                  </select>
+                  {asetList.length === 0 && (
+                    <p className="text-sm text-amber-600 mt-1">
+                      ⚠️ Tidak ada aset aktif. Silakan tambahkan aset terlebih dahulu.
+                    </p>
+                  )}
                 </div>
 
                 <div>
@@ -386,6 +548,7 @@ const Jadwal = () => {
                     className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
                     value={form.tanggal}
                     onChange={(e) => setForm({ ...form, tanggal: e.target.value })}
+                    disabled={isSubmitting}
                     required
                   />
                 </div>
@@ -399,6 +562,7 @@ const Jadwal = () => {
                     className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
                     value={form.waktu}
                     onChange={(e) => setForm({ ...form, waktu: e.target.value })}
+                    disabled={isSubmitting}
                     required
                   />
                 </div>
@@ -413,6 +577,7 @@ const Jadwal = () => {
                     rows="3"
                     value={form.alamat}
                     onChange={(e) => setForm({ ...form, alamat: e.target.value })}
+                    disabled={isSubmitting}
                     required
                   />
                 </div>
@@ -423,6 +588,7 @@ const Jadwal = () => {
                     className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
                     value={form.status}
                     onChange={(e) => setForm({ ...form, status: e.target.value })}
+                    disabled={isSubmitting}
                   >
                     <option value="scheduled">Terjadwal</option>
                     <option value="completed">Selesai</option>
@@ -438,6 +604,7 @@ const Jadwal = () => {
                     className="w-full px-4 py-3 border border-gray-300 rounded-xl focus:ring-2 focus:ring-blue-500 focus:border-transparent transition-all duration-200"
                     value={form.keterangan}
                     onChange={(e) => setForm({ ...form, keterangan: e.target.value })}
+                    disabled={isSubmitting}
                   />
                 </div>
               </div>
@@ -446,15 +613,33 @@ const Jadwal = () => {
                 <button
                   type="button"
                   onClick={() => setShowForm(false)}
-                  className="px-6 py-3 border border-gray-300 text-gray-700 rounded-xl hover:bg-gray-50 transition-colors font-medium"
+                  disabled={isSubmitting}
+                  className="px-6 py-3 border border-gray-300 text-gray-700 rounded-xl hover:bg-gray-50 transition-colors font-medium disabled:opacity-50"
                 >
                   Batal
                 </button>
                 <button
                   type="submit"
-                  className="px-6 py-3 bg-gradient-to-r from-blue-600 to-blue-700 text-white rounded-xl hover:from-blue-700 hover:to-blue-800 transition-all duration-200 font-medium shadow-lg hover:shadow-xl"
+                  disabled={isSubmitting || asetList.length === 0}
+                  className={`px-6 py-3 rounded-xl font-medium shadow-lg hover:shadow-xl flex items-center space-x-2 transition-all duration-200 ${
+                    isSubmitting || asetList.length === 0
+                      ? 'bg-gray-400 cursor-not-allowed' 
+                      : 'bg-gradient-to-r from-blue-600 to-blue-700 text-white hover:from-blue-700 hover:to-blue-800'
+                  }`}
                 >
-                  {editingJadwal ? "Perbarui" : "Simpan"} Jadwal
+                  {isSubmitting ? (
+                    <>
+                      <div className="animate-spin rounded-full h-4 w-4 border-b-2 border-white"></div>
+                      <span>Menyimpan...</span>
+                    </>
+                  ) : (
+                    <>
+                      <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 13l4 4L19 7" />
+                      </svg>
+                      <span>{editingJadwal ? "Perbarui" : "Simpan"} Jadwal</span>
+                    </>
+                  )}
                 </button>
               </div>
             </form>
