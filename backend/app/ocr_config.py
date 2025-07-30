@@ -1,4 +1,4 @@
-# app/ocr_config.py - Enhanced OCR configuration untuk Tesseract
+# app/ocr_config.py - Enhanced dengan train project logic untuk fix longitude parsing
 
 import cv2
 import numpy as np
@@ -12,19 +12,19 @@ logger = logging.getLogger(__name__)
 
 class CoordinateOCRConfig:
     """
-    Enhanced OCR configuration untuk koordinat GPS menggunakan Tesseract
-    Migrasi dari EasyOCR dengan optimasi khusus untuk koordinat
+    Enhanced OCR configuration untuk koordinat GPS
+    DENGAN LOGIKA TRAIN PROJECT untuk fix masalah longitude 1073° -> 107°34'
     """
     
     def __init__(self):
-        """Initialize dengan konfigurasi optimal untuk koordinat"""
+        """Initialize dengan konfigurasi optimal dari train project"""
         
         # Set tesseract path untuk Windows (uncomment jika perlu)
         # pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files\Tesseract-OCR\tesseract.exe'
         
-        # OCR configurations yang dioptimalkan untuk koordinat GPS
+        # OCR configurations yang sudah dioptimalkan berdasarkan train project
         self.ocr_configs = [
-            # Config dengan whitelist karakter koordinat
+            # Config dengan whitelist karakter koordinat (terbaik dari train project)
             {
                 'name': 'coordinate_optimized',
                 'config': r'--oem 3 --psm 6 -c tessedit_char_whitelist=0123456789°\'".,NSEW ',
@@ -55,19 +55,15 @@ class CoordinateOCRConfig:
                 'name': 'general_line',
                 'config': r'--oem 3 --psm 7',
                 'description': 'General single line fallback'
-            },
-            {
-                'name': 'general_word',
-                'config': r'--oem 3 --psm 8',
-                'description': 'General single word fallback'
             }
         ]
         
-        logger.info("CoordinateOCRConfig initialized with Tesseract")
+        logger.info("CoordinateOCRConfig initialized with train project logic")
 
     def read_coordinates_optimized(self, image_path: str) -> List[str]:
         """
         OCR dengan konfigurasi yang dioptimalkan untuk koordinat
+        Enhanced version dengan train project logic
         """
         try:
             img = cv2.imread(image_path)
@@ -77,12 +73,14 @@ class CoordinateOCRConfig:
             
             results = []
             
+            # Gunakan semua config untuk maximum coverage
             for config_info in self.ocr_configs:
                 try:
                     text = pytesseract.image_to_string(img, config=config_info['config'])
                     if text and text.strip():
-                        results.append(text.strip())
-                        logger.debug(f"OCR success with {config_info['name']}: {text.strip()[:50]}...")
+                        cleaned_text = clean_ocr_text_enhanced(text.strip())
+                        results.append(cleaned_text)
+                        logger.debug(f"OCR success with {config_info['name']}: {cleaned_text[:50]}...")
                 except Exception as e:
                     logger.debug(f"OCR failed with {config_info['name']}: {e}")
                     continue
@@ -93,46 +91,10 @@ class CoordinateOCRConfig:
             logger.error(f"Error in read_coordinates_optimized: {e}")
             return []
 
-    def extract_text_from_regions(self, image_path: str, regions: List[Dict]) -> Dict[str, List[str]]:
-        """
-        Extract text dari region-region spesifik dalam gambar
-        """
-        try:
-            img = cv2.imread(image_path)
-            if img is None:
-                return {}
-            
-            results = {}
-            
-            for region in regions:
-                region_name = region.get('name', 'unknown')
-                x, y, w, h = region['x'], region['y'], region['width'], region['height']
-                
-                # Crop region
-                roi = img[y:y+h, x:x+w]
-                
-                # OCR pada region
-                region_texts = []
-                for config_info in self.ocr_configs[:4]:  # Use first 4 configs only
-                    try:
-                        text = pytesseract.image_to_string(roi, config=config_info['config'])
-                        if text and text.strip():
-                            region_texts.append(text.strip())
-                    except:
-                        continue
-                
-                results[region_name] = region_texts
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error in extract_text_from_regions: {e}")
-            return {}
-
 
 def enhance_image_for_coordinates(image_path: str) -> str:
     """
-    Enhanced image preprocessing khusus untuk koordinat GPS
+    Enhanced image preprocessing dengan multiple methods dari train project
     """
     try:
         img = cv2.imread(image_path)
@@ -140,10 +102,21 @@ def enhance_image_for_coordinates(image_path: str) -> str:
             logger.error(f"Cannot read image: {image_path}")
             return image_path
         
-        logger.debug(f"Enhancing image: {image_path}")
+        logger.debug(f"Enhancing image with train project methods: {image_path}")
         
+        height, width = img.shape[:2]
+        
+        # Crop area koordinat GPS (sama dengan train project)
+        y_start = int(height * 0.72)
+        y_end = int(height * 0.76)
+        x_start = int(width * 0.25)
+        x_end = int(width * 0.96)
+        
+        cropped_img = img[y_start:y_end, x_start:x_end]
+        
+        # Enhanced preprocessing dengan multiple methods
         # Convert ke grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        gray = cv2.cvtColor(cropped_img, cv2.COLOR_BGR2GRAY)
         
         # Invert untuk teks putih di background gelap
         inverted = cv2.bitwise_not(gray)
@@ -151,25 +124,20 @@ def enhance_image_for_coordinates(image_path: str) -> str:
         # Gaussian blur untuk reduce noise
         blurred = cv2.GaussianBlur(inverted, (3, 3), 0)
         
-        # Adaptive threshold untuk kontras yang lebih baik
+        # Adaptive Gaussian threshold (terbaik dari train project)
         adaptive = cv2.adaptiveThreshold(
             blurred, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
-            cv2.THRESH_BINARY, 15, 4
+            cv2.THRESH_BINARY, 15, 10
         )
         
-        # Morphological operations untuk cleanup
-        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 1))
+        # Morphological cleanup
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
         cleaned = cv2.morphologyEx(adaptive, cv2.MORPH_CLOSE, kernel)
+        opened = cv2.morphologyEx(cleaned, cv2.MORPH_OPEN, kernel)
         
-        # Sharpening untuk karakter yang lebih jelas
-        kernel_sharp = np.array([[-1,-1,-1], [-1, 9,-1], [-1,-1,-1]])
-        sharpened = cv2.filter2D(cleaned, -1, kernel_sharp)
-        
-        # Resize untuk meningkatkan resolusi
-        height, width = sharpened.shape
-        new_width = int(width * 2.5)
-        new_height = int(height * 2.5)
-        resized = cv2.resize(sharpened, (new_width, new_height), interpolation=cv2.INTER_CUBIC)
+        # Resize untuk meningkatkan resolusi (train project scaling)
+        scale_factor = 3
+        resized = cv2.resize(opened, None, fx=scale_factor, fy=scale_factor, interpolation=cv2.INTER_CUBIC)
         
         # Save enhanced image
         enhanced_path = str(Path(image_path).with_suffix('')) + '_enhanced.jpg'
@@ -182,144 +150,67 @@ def enhance_image_for_coordinates(image_path: str) -> str:
         logger.error(f"Error in enhance_image_for_coordinates: {e}")
         return image_path
 
-def segment_coordinate_region(image_path: str) -> List[str]:
+def clean_ocr_text_enhanced(text: str) -> str:
     """
-    Segmentasi gambar untuk fokus pada area koordinat
+    Enhanced OCR text cleaning dengan train project character corrections
     """
-    try:
-        img = cv2.imread(image_path)
-        if img is None:
-            return [image_path]
-        
-        height, width = img.shape[:2]
-        
-        # Define regions yang kemungkinan mengandung koordinat
-        regions = [
-            # Full coordinate area (center-bottom of overlay)
-            {
-                'name': 'full_coords',
-                'y_start': int(height * 0.68),
-                'y_end': int(height * 0.80),
-                'x_start': int(width * 0.05),
-                'x_end': int(width * 0.95)
-            },
-            # Upper coordinate area  
-            {
-                'name': 'upper_coords',
-                'y_start': int(height * 0.70),
-                'y_end': int(height * 0.76),
-                'x_start': int(width * 0.10),
-                'x_end': int(width * 0.90)
-            },
-            # Lower coordinate area
-            {
-                'name': 'lower_coords', 
-                'y_start': int(height * 0.74),
-                'y_end': int(height * 0.78),
-                'x_start': int(width * 0.10),
-                'x_end': int(width * 0.90)
-            }
-        ]
-        
-        segments = []
-        
-        for region in regions:
-            try:
-                y_start = region['y_start']
-                y_end = region['y_end']
-                x_start = region['x_start']
-                x_end = region['x_end']
-                
-                # Crop region
-                roi = img[y_start:y_end, x_start:x_end]
-                
-                # Save segment
-                segment_path = str(Path(image_path).with_suffix('')) + f"_segment_{region['name']}.jpg"
-                cv2.imwrite(segment_path, roi)
-                segments.append(segment_path)
-                
-                logger.debug(f"Segment saved: {segment_path}")
-                
-            except Exception as e:
-                logger.debug(f"Error creating segment {region['name']}: {e}")
-                continue
-        
-        return segments if segments else [image_path]
-        
-    except Exception as e:
-        logger.error(f"Error in segment_coordinate_region: {e}")
-        return [image_path]
-
-def validate_dms_format(coord_str: str) -> bool:
-    """
-    Validasi format DMS (Degrees Minutes Seconds)
-    """
-    if not coord_str:
-        return False
+    if not text:
+        return ""
     
-    # Pattern untuk DMS format
-    pattern = r'^\d{1,3}°\s*\d{1,2}\'\s*\d{1,2}(?:\.\d+)?\"\s*[NSEW]$'
-    return bool(re.match(pattern, coord_str.strip()))
-
-def convert_dms_to_decimal(dms_str: str) -> float:
-    """
-    Convert DMS string ke decimal degrees
-    """
-    try:
-        if not dms_str:
-            return 0.0
-        
-        # Extract numbers dan direction
-        parts = re.findall(r'(\d+(?:\.\d+)?)', dms_str)
-        direction_match = re.search(r'[NSEW]', dms_str.upper())
-        
-        if len(parts) >= 3 and direction_match:
-            degrees = float(parts[0])
-            minutes = float(parts[1])
-            seconds = float(parts[2])
-            direction = direction_match.group()
-            
-            # Convert ke decimal degrees
-            decimal = degrees + (minutes / 60) + (seconds / 3600)
-            
-            # Apply direction (negative untuk South dan West)
-            if direction in ['S', 'W']:
-                decimal = -decimal
-                
-            return round(decimal, 6)
-        
-        return 0.0
-        
-    except Exception as e:
-        logger.debug(f"Error converting DMS to decimal: {e}")
-        return 0.0
+    # Character corrections dari train project analysis
+    char_mapping = {
+        'o': '°', 'O': '°', '*': '°', '0': '°',
+        '§': '5',  # PENTING: Fix untuk 6° §2' -> 6° 52'
+        '/': "'", '\\': "'", '|': "'", 'I': "'",
+        ',': '.',
+        'Z': 'S',  # Common OCR error
+        '`': "'",  # Backtick to apostrophe
+        '’': "'",  # Apostrof kanan (U+2019)
+        '‘': "'",  # Apostrof kiri (U+2018)
+        '′': "'",  # Prime symbol (U+2032)
+        '"': '"',  # Smart quote normalization
+    }
+    
+    cleaned = text
+    for old_char, new_char in char_mapping.items():
+        cleaned = cleaned.replace(old_char, new_char)
+    
+    # Remove unwanted characters tapi keep coordinate chars
+    cleaned = re.sub(r'[^\d°\'\"NSEW\s\.,]', ' ', cleaned)
+    cleaned = re.sub(r'\s+', ' ', cleaned).strip()
+    
+    return cleaned
 
 def is_coordinate_in_indonesia(lat_str: str, lon_str: str) -> bool:
     """
-    Validasi apakah koordinat berada di wilayah Indonesia
+    Enhanced validation untuk koordinat Indonesia dengan train project logic
     """
     try:
         if not lat_str or not lon_str:
             return False
         
-        lat_decimal = convert_dms_to_decimal(lat_str)
-        lon_decimal = convert_dms_to_decimal(lon_str)
+        # Extract degrees dari DMS format dengan better parsing
+        lat_match = re.search(r'(\d+)°', lat_str)
+        lon_match = re.search(r'(\d+)°', lon_str)
         
-        # Batas wilayah Indonesia (approximate)
-        # Latitude: 6°N to 11°S (-11 to 6)
-        # Longitude: 95°E to 141°E (95 to 141)
-        indonesia_bounds = {
-            'lat_min': -11,
-            'lat_max': 6,
-            'lon_min': 95,
-            'lon_max': 141
-        }
+        if lat_match and lon_match:
+            lat_deg = int(lat_match.group(1))
+            lon_deg = int(lon_match.group(1))
+            
+            # VALIDASI ADDITIONAL: cek apakah parsing benar
+            if lat_deg > 90 or lon_deg > 180:
+                logger.warning(f"Invalid coordinate parsing detected: lat={lat_deg}°, lon={lon_deg}°")
+                return False
+            
+            # Indonesia bounds check
+            # Latitude: 6°N to 11°S, Longitude: 95°E to 141°E
+            if 'S' in lat_str.upper() and lat_deg <= 11:
+                if 'E' in lon_str.upper() and 95 <= lon_deg <= 141:
+                    return True
+            elif 'N' in lat_str.upper() and lat_deg <= 6:
+                if 'E' in lon_str.upper() and 95 <= lon_deg <= 141:
+                    return True
         
-        if (indonesia_bounds['lat_min'] <= lat_decimal <= indonesia_bounds['lat_max'] and
-            indonesia_bounds['lon_min'] <= lon_decimal <= indonesia_bounds['lon_max']):
-            return True
-        
-        logger.debug(f"Coordinates outside Indonesia: {lat_decimal}, {lon_decimal}")
         return False
         
     except Exception as e:
@@ -328,7 +219,8 @@ def is_coordinate_in_indonesia(lat_str: str, lon_str: str) -> bool:
 
 def extract_coordinates_from_text(text: str) -> Optional[Dict[str, str]]:
     """
-    Extract koordinat dari text menggunakan regex patterns
+    Extract koordinat dari text menggunakan ENHANCED PATTERNS dari train project
+    INI YANG AKAN MEMPERBAIKI MASALAH LONGITUDE 1073° -> 107°34'
     """
     if not text:
         return None
@@ -336,23 +228,29 @@ def extract_coordinates_from_text(text: str) -> Optional[Dict[str, str]]:
     try:
         logger.debug(f"Extracting coordinates from text: {text[:100]}...")
         
-        # Clean text
-        cleaned_text = text.replace('\n', ' ').replace('\r', ' ')
+        # Clean text dengan enhanced cleaning
+        cleaned_text = clean_ocr_text_enhanced(text.replace('\n', ' ').replace('\r', ' '))
         cleaned_text = re.sub(r'\s+', ' ', cleaned_text)
         
-        # Multiple coordinate patterns
+        # ENHANCED Coordinate patterns dari train project
         patterns = [
             # Standard format: 6°52'35.622"S 107°34'37.722"E
-            r'(\d{1,3})°\s*(\d{1,2})\'\s*(\d{1,2}(?:\.\d+)?)\"\s*([NS])\s+(\d{1,3})°\s*(\d{1,2})\'\s*(\d{1,2}(?:\.\d+)?)\"\s*([EW])',
+            r'(\d{1,3})°\s*(\d{1,2})\'\s*(\d{1,2}(?:\.\d+)?)\"\s*([NS])\s*[,\s]*(\d{1,3})°\s*(\d{1,2})\'\s*(\d{1,2}(?:\.\d+)?)\"\s*([EW])',
             
             # With comma decimal: 6°52'35,622"S 107°34'37,722"E
-            r'(\d{1,3})°\s*(\d{1,2})\'\s*(\d{1,2}(?:,\d+)?)\"\s*([NS])\s+(\d{1,3})°\s*(\d{1,2})\'\s*(\d{1,2}(?:,\d+)?)\"\s*([EW])',
+            r'(\d{1,3})°\s*(\d{1,2})\'\s*(\d{1,2}(?:,\d+)?)\"\s*([NS])\s*[,\s]*(\d{1,3})°\s*(\d{1,2})\'\s*(\d{1,2}(?:,\d+)?)\"\s*([EW])',
+            
+            # With extra spaces: 6° 52' 35.622" S 107° 34' 37.722" E
+            r'(\d{1,3})°\s+(\d{1,2})\'\s+(\d{1,2}(?:[.,]\d+)?)\"\s+([NS])\s*[,\s]*(\d{1,3})°\s+(\d{1,2})\'\s+(\d{1,2}(?:[.,]\d+)?)\"\s+([EW])',
             
             # Simplified: 6 52 35.622 S 107 34 37.722 E
-            r'(\d{1,3})\s+(\d{1,2})\s+(\d{1,2}(?:[.,]\d+)?)\s+([NS])\s+(\d{1,3})\s+(\d{1,2})\s+(\d{1,2}(?:[.,]\d+)?)\s+([EW])',
+            r'(\d{1,3})\s+(\d{1,2})\s+(\d{1,2}(?:[.,]\d+)?)\s+([NS])\s*[,\s]*(\d{1,3})\s+(\d{1,2})\s+(\d{1,2}(?:[.,]\d+)?)\s+([EW])',
             
             # Compact: 6°52'35.622"S107°34'37.722"E
             r'(\d{1,3})°(\d{1,2})\'(\d{1,2}(?:[.,]\d+)?)\"([NS])(\d{1,3})°(\d{1,2})\'(\d{1,2}(?:[.,]\d+)?)\"([EW])',
+            
+            # OCR errors with Z->S correction
+            r'(\d{1,3})°\s*(\d{1,2})[\']*\s*(\d{1,2}(?:[.,]\d+)?)[\"]*\s*([NSEWZ])\s*[,\s]*(\d{1,3})°\s*(\d{1,2})[\']*\s*(\d{1,2}(?:[.,]\d+)?)[\"]*\s*([NSEWZ])',
         ]
         
         for i, pattern in enumerate(patterns):
@@ -365,13 +263,32 @@ def extract_coordinates_from_text(text: str) -> Optional[Dict[str, str]]:
                     # Parse longitude  
                     lon_deg, lon_min, lon_sec, lon_dir = groups[4], groups[5], groups[6], groups[7]
                     
+                    # VALIDASI COORDINATE VALUES (ini yang akan fix masalah 1073°)
+                    try:
+                        lat_deg_int = int(lat_deg)
+                        lon_deg_int = int(lon_deg)
+                        
+                        if lat_deg_int > 90 or lon_deg_int > 180:
+                            logger.warning(f"Invalid coordinate values detected: lat={lat_deg_int}°, lon={lon_deg_int}°")
+                            continue  # Skip pattern ini, coba pattern berikutnya
+                            
+                    except ValueError:
+                        logger.warning(f"Cannot parse coordinate degrees: lat={lat_deg}, lon={lon_deg}")
+                        continue
+                    
+                    # Fix common OCR errors
+                    lat_dir = lat_dir.upper()
+                    lon_dir = lon_dir.upper()
+                    if lat_dir == 'Z': lat_dir = 'S'
+                    if lon_dir == 'Z': lon_dir = 'E'
+                    
                     # Normalize decimal separator
                     lat_sec = lat_sec.replace(',', '.')
                     lon_sec = lon_sec.replace(',', '.')
                     
                     # Format DMS strings
-                    latitude = f"{lat_deg}° {lat_min}' {lat_sec}\" {lat_dir.upper()}"
-                    longitude = f"{lon_deg}° {lon_min}' {lon_sec}\" {lon_dir.upper()}"
+                    latitude = f"{lat_deg}° {lat_min}' {lat_sec}\" {lat_dir}"
+                    longitude = f"{lon_deg}° {lon_min}' {lon_sec}\" {lon_dir}"
                     
                     logger.debug(f"Pattern {i+1} matched: {latitude}, {longitude}")
                     
@@ -387,10 +304,10 @@ def extract_coordinates_from_text(text: str) -> Optional[Dict[str, str]]:
         logger.error(f"Error extracting coordinates from text: {e}")
         return None
 
-# Utility functions untuk debugging
+# Utility functions untuk debugging (enhanced)
 def test_ocr_configs(image_path: str) -> Dict[str, str]:
     """
-    Test semua OCR configs pada gambar untuk debugging
+    Test OCR configs pada gambar untuk debugging dengan enhanced logic
     """
     if not Path(image_path).exists():
         return {}
@@ -403,10 +320,12 @@ def test_ocr_configs(image_path: str) -> Dict[str, str]:
         if img is None:
             return {}
         
+        # Test semua config
         for config_info in config.ocr_configs:
             try:
                 text = pytesseract.image_to_string(img, config=config_info['config'])
-                results[config_info['name']] = text.strip() if text else ""
+                cleaned = clean_ocr_text_enhanced(text.strip()) if text else ""
+                results[config_info['name']] = cleaned
             except Exception as e:
                 results[config_info['name']] = f"ERROR: {str(e)}"
         
@@ -418,15 +337,15 @@ def test_ocr_configs(image_path: str) -> Dict[str, str]:
 
 def debug_coordinate_extraction(image_path: str) -> Dict[str, Any]:
     """
-    Debug function untuk testing koordinat extraction step by step
+    Enhanced debug function untuk testing koordinat extraction
     """
     debug_info = {
         'image_path': image_path,
         'image_exists': Path(image_path).exists(),
         'enhanced_path': '',
-        'segments': [],
         'ocr_results': {},
         'coordinates_found': None,
+        'coordinate_parsing_attempts': [],
         'errors': []
     }
     
@@ -439,28 +358,54 @@ def debug_coordinate_extraction(image_path: str) -> Dict[str, Any]:
         enhanced_path = enhance_image_for_coordinates(image_path)
         debug_info['enhanced_path'] = enhanced_path
         
-        # Test segmentation
-        segments = segment_coordinate_region(image_path)
-        debug_info['segments'] = segments
-        
         # Test OCR configs
         ocr_results = test_ocr_configs(enhanced_path)
         debug_info['ocr_results'] = ocr_results
         
-        # Test coordinate extraction
+        # Test coordinate extraction dengan detailed attempts
         for config_name, text in ocr_results.items():
             if text and not text.startswith('ERROR'):
                 coords = extract_coordinates_from_text(text)
-                if coords:
+                attempt_info = {
+                    'config': config_name,
+                    'text': text[:100] + "..." if len(text) > 100 else text,
+                    'coordinates_found': bool(coords),
+                    'coordinates': coords if coords else None,
+                    'text_length': len(text)
+                }
+                debug_info['coordinate_parsing_attempts'].append(attempt_info)
+                
+                if coords and not debug_info['coordinates_found']:
                     debug_info['coordinates_found'] = {
                         'method': config_name,
                         'coordinates': coords,
-                        'text': text
+                        'text': text,
+                        'indonesia_validation': is_coordinate_in_indonesia(coords['latitude'], coords['longitude'])
                     }
-                    break
         
         return debug_info
         
     except Exception as e:
         debug_info['errors'].append(f"Debug error: {str(e)}")
         return debug_info
+
+def validate_coordinate_parsing(test_text: str) -> Dict[str, Any]:
+    """
+    Function untuk test parsing koordinat dengan text sample
+    """
+    result = {
+        'input_text': test_text,
+        'cleaned_text': clean_ocr_text_enhanced(test_text),
+        'coordinates': extract_coordinates_from_text(test_text),
+        'parsing_successful': False,
+        'indonesia_validation': False
+    }
+    
+    if result['coordinates']:
+        result['parsing_successful'] = True
+        result['indonesia_validation'] = is_coordinate_in_indonesia(
+            result['coordinates']['latitude'], 
+            result['coordinates']['longitude']
+        )
+    
+    return result
