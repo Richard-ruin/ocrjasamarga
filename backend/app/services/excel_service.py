@@ -1,4 +1,4 @@
-# app/services/excel_service.py - Updated with enhanced features
+# app/services/excel_service.py - Updated with enhanced features + Time in H22:J22
 from openpyxl import load_workbook
 from openpyxl.drawing.image import Image as ExcelImage
 from pathlib import Path
@@ -45,6 +45,38 @@ def format_indonesian_date(date_str: str) -> str:
         }
         return f"{today.day} {bulan_indonesia[today.month]} {today.year}"
 
+def format_time_only(time_str: str) -> str:
+    """
+    Format waktu ke format HH:MM tanpa simbol ':'
+    """
+    try:
+        # Jika time_str berupa datetime string lengkap
+        if isinstance(time_str, str) and len(time_str) >= 8:
+            # Coba parse dari format datetime lengkap
+            if 'T' in time_str:
+                time_part = time_str.split('T')[1][:8]  # Ambil bagian waktu
+                time_obj = datetime.strptime(time_part, "%H:%M:%S").time()
+            elif ' ' in time_str and ':' in time_str:
+                # Format "YYYY-MM-DD HH:MM:SS"
+                time_part = time_str.split(' ')[1][:8]
+                time_obj = datetime.strptime(time_part, "%H:%M:%S").time()
+            else:
+                # Langsung format HH:MM:SS atau HH:MM
+                time_obj = datetime.strptime(time_str[:5], "%H:%M").time()
+        else:
+            # Fallback ke waktu sekarang
+            time_obj = datetime.now().time()
+        
+        # Format: "08.30" (tanpa simbol :)
+        formatted_time = f"{time_obj.hour:02d}.{time_obj.minute:02d}"
+        return formatted_time
+        
+    except Exception as e:
+        logger.warning(f"Error formatting time {time_str}: {e}")
+        # Fallback ke waktu sekarang
+        now = datetime.now()
+        return f"{now.hour:02d}.{now.minute:02d}"
+
 def generate_excel(data: List[dict], save_dir: Path) -> Path:
     """
     Generate Excel file dengan koordinat dari cache data dan enhanced features
@@ -58,7 +90,7 @@ def generate_excel(data: List[dict], save_dir: Path) -> Path:
     ws = wb.active
     start_row = 9
 
-    logger.info(f"=== EXCEL SERVICE START (Enhanced) ===")
+    logger.info(f"=== EXCEL SERVICE START (Enhanced with Time) ===")
     logger.info(f"Generating Excel with {len(data)} entries")
 
     # ✅ ENHANCED FEATURE 1: Format tanggal jadwal untuk J4
@@ -79,6 +111,7 @@ def generate_excel(data: List[dict], save_dir: Path) -> Path:
         formatted_date = format_indonesian_date(tanggal_jadwal)
         ws['J4'] = f": {formatted_date}"
         logger.info(f"✅ SET J4 (Tanggal Jadwal) = ': {formatted_date}' from '{tanggal_jadwal}'")
+        
         
     except Exception as date_error:
         logger.error(f"Error setting jadwal date in J4: {date_error}")
@@ -107,6 +140,31 @@ def generate_excel(data: List[dict], save_dir: Path) -> Path:
         logger.error(f"Error setting nama aset in C2: {aset_error}")
         # Fallback
         ws['C2'] = "Nama Aset"
+
+    # ✅ ENHANCED FEATURE 4: Waktu di merged cells H22:J22 (BARU!)
+    try:
+        # Ambil waktu dari jadwal
+        waktu_jadwal = ""
+        if data and len(data) > 0:
+            # Prioritas: waktu_inspeksi > waktu > created_at
+            waktu_jadwal = data[0].get("waktu_inspeksi", "")
+            if not waktu_jadwal:
+                waktu_jadwal = data[0].get("waktu", "")
+            if not waktu_jadwal:
+                waktu_jadwal = data[0].get("created_at", "")
+        
+        if not waktu_jadwal:
+            waktu_jadwal = datetime.now().isoformat()
+        
+        formatted_time = format_time_only(waktu_jadwal)
+        ws['H22'] = formatted_time  # Set di H22 (yang di-merge dengan H22:J22)
+        logger.info(f"✅ SET H22 (Merged H22:J22) = '{formatted_time}' from '{waktu_jadwal}'")
+        
+    except Exception as time_error:
+        logger.error(f"Error setting waktu in H22: {time_error}")
+        # Fallback ke waktu sekarang
+        now_formatted = format_time_only(datetime.now().isoformat())
+        ws['H22'] = now_formatted
 
     # ✅ BUAT TEMP DIRECTORY UNTUK GAMBAR
     temp_dir = Path(tempfile.gettempdir()) / "excel_images"
@@ -198,7 +256,8 @@ def generate_excel(data: List[dict], save_dir: Path) -> Path:
         logger.info("=== ENHANCED FEATURES APPLIED ===")
         logger.info(f"1. Tanggal Jadwal in J4: {ws['J4'].value}")
         logger.info(f"2. Asset name in C2: {ws['C2'].value}")
-        logger.info(f"3. Total data rows processed: {len(data)}")
+        logger.info(f"3. Waktu in H22: {ws['H22'].value}")  # NEW!
+        logger.info(f"4. Total data rows processed: {len(data)}")
         
         # Informasi tambahan dari data jadwal
         if data and len(data) > 0:
